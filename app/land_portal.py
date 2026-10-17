@@ -1075,6 +1075,11 @@ def logo_image():
     return send_file(os.path.join(BASE, "src", "img", "logo.png"), mimetype="image/png")
 
 
+@app.route("/assets/logo_dark.png")
+def logo_dark_image():
+    return send_file(os.path.join(BASE, "src", "img", "logo_dark.png"), mimetype="image/png")
+
+
 # ----------------------------------------------------------------- demo data
 DEMO = [("gazipur_001", 24.0023, 90.4264, "গাজীপুর সদর"), ("dhaka_014", 23.8583, 90.2667, "সাভার"),
         ("cumilla_007", 23.4607, 91.1809, "কুমিল্লা সদর")]
@@ -1126,7 +1131,7 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>আমার ভূমি</title>
-<script>try{document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}catch(e){}</script>
+<script>try{document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');matchMedia('(prefers-color-scheme:dark)').addEventListener('change',e=>{if(!localStorage.theme)document.documentElement.dataset.theme=e.matches?'dark':'light'});}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Noto+Sans+Bengali:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
@@ -1148,6 +1153,8 @@ h1,h2,h3,h4{margin:0;line-height:1.25}
 .nav-in{height:100%;max-width:1280px;margin:0 auto;padding:0 18px;display:flex;align-items:center;gap:14px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:var(--g);flex-shrink:0}
 .logo{display:block;width:156px;height:50px;object-fit:contain;object-position:left center}
+[data-theme=dark] .logo-light{display:none!important}
+html:not([data-theme=dark]) .logo-dark{display:none!important}
 .nav-links{display:flex;align-items:center;gap:4px;margin-left:18px;flex:1;min-width:0}
 .nav-links a{padding:8px 13px;border-radius:10px;color:var(--mu);font-weight:500;font-size:15px;white-space:nowrap;flex-shrink:0}
 .nav-links a:hover{background:var(--sf2);color:var(--tx)}.nav-links a.on{background:var(--gt);color:var(--g)}
@@ -1280,9 +1287,13 @@ dialog::backdrop{background:rgba(0,0,0,.55)}.dhead{display:flex;justify-content:
 .pb input[type=search]{margin-bottom:8px}
 .stats4{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}.stats4 div{background:var(--sf2);border-radius:12px;padding:8px 10px}.stats4 b{display:block;font-size:17px;color:var(--g)}.stats4 span{font-size:11px;color:var(--mu)}
 .plist{max-height:200px;overflow:auto}
-.rw{display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:9px;font-size:13px;cursor:pointer}.rw:hover{background:var(--sf2)}
+.rw{display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:9px;font-size:13px;cursor:pointer;text-align:left}.rw:hover{background:var(--sf2)}
+.rw input{width:auto;margin:0;padding:0;flex:none;accent-color:var(--g2);cursor:pointer}
+.rw .lbl{flex:1;min-width:0;text-align:left}
 .sw{width:14px;height:14px;border-radius:4px;flex:none;border:1px solid rgba(0,0,0,.2)}.rw .n{margin-left:auto;color:var(--mu);font-size:12px;white-space:nowrap}
-.chk{display:flex;align-items:center;gap:8px;padding:4px 2px;font-size:13.5px;cursor:pointer}.chk input{width:auto}
+.chk{display:flex;align-items:center;gap:8px;padding:4px 2px;font-size:13.5px;cursor:pointer;text-align:left}.chk input{width:auto;margin:0;accent-color:var(--g2)}
+#legend{display:flex;flex-direction:column;gap:2px;text-align:left}
+input[type=checkbox],input[type=radio]{width:auto;margin:0;padding:0;accent-color:var(--g2);cursor:pointer}
 .pb input[type=range]{padding:0;accent-color:var(--g2)}
 .chip{border:1px solid var(--ln);background:var(--sf);color:var(--tx);padding:5px 10px;border-radius:99px;font:inherit;font-size:12px;cursor:pointer}.chip.on{background:var(--g);color:var(--on);border-color:var(--g)}
 .fabs{position:absolute;z-index:1000;right:12px;bottom:112px}
@@ -1395,7 +1406,7 @@ main{margin-left:var(--side-nav);transition:margin-left .25s}
 </head>
 <body>
 <header class="nav"><div class="nav-in">
-  <a class="brand" href="#/" aria-label="AmarBhumi"><img class="logo" src="/assets/logo.png" alt="AmarBhumi আমার ভূমি"></a>
+  <a class="brand" href="#/" aria-label="AmarBhumi"><img class="logo logo-light" src="/assets/logo.png" alt="AmarBhumi আমার ভূমি"><img class="logo logo-dark" src="/assets/logo_dark.png" alt="AmarBhumi আমার ভূমি"></a>
   <div class="tools">
     <span class="avatar" aria-hidden="true">U</span>
     <div class="seg" id="roleSeg"><button data-role="user" data-i18n="role_user"></button><button data-role="admin" data-i18n="role_admin"></button></div>
@@ -1593,7 +1604,7 @@ m_total:["মোট দাগ","Plots"],m_parts:["ভূমি অংশ","Land 
 m_click_ds:["লোড করতে ক্লিক করুন","Click to load"],m_none:["কোনো ডেটা নেই","No data"],m_refreshed:["ডেটা হালনাগাদ হয়েছে","Data refreshed"],m_loaded:["লোড হয়েছে","loaded"],m_nodata:["কিছু পাওয়া যায়নি","Nothing found"],
 m_locating:["অবস্থান খোঁজা হচ্ছে…","Locating…"],m_here:["আপনার অবস্থান","You are here"],m_place_hit:["এলাকায় ডেটাসেট পাওয়া গেছে — লোড হচ্ছে","Dataset found nearby — loading"],
 bm_sat:["স্যাটেলাইট","Satellite"],bm_satl:["স্যাটেলাইট + লেবেল","Satellite + labels"],bm_osm:["ওএসএম","OSM"],bm_topo:["ভূসংস্থান","Topo"],bm_light:["হালকা","Light"],bm_dark:["গাঢ়","Dark"],
-c_Settlement:["বসতবাড়ি","Settlement"],c_Agriculture:["কৃষি","Agriculture"],c_Commercial_Area:["বাণিজ্যিক","Commercial"],c_Water_Body:["জলাশয়","Water body"],c_Road:["সড়ক","Road"],c_Industrial_Area:["শিল্প এলাকা","Industrial"],c_Forest:["বন","Forest"],c_Vacant_Land:["পতিত জমি","Vacant land"],
+c_Settlement:["বসতবাড়ি","Settlement"],c_Agriculture:["কৃষি","Agriculture"],c_Agricultural_Land:["কৃষি","Agricultural"],c_Commercial_Area:["বাণিজ্যিক","Commercial"],c_Water_Body:["জলাশয়","Water body"],c_Waterbody:["জলাশয়","Water body"],c_Educational_Institution:["শিক্ষাপ্রতিষ্ঠান","Educational institution"],c_Recreational_Place:["বিনোদনমূলক স্থান","Recreational space"],c_Road:["সড়ক","Road"],c_Religious_Place:["ধর্মীয় স্থান","Religious Place"],c_Industrial_Area:["শিল্প এলাকা","Industrial"],c_Forest:["বন","Forest"],c_Administrative_Area:["প্রশাসনিক এলাকা","Administrative Area"],c_Vacant_Land:["পতিত জমি","Vacant land"],c_Miscellaneous_Landuse:["বিবিধ","Miscellaneous land"],
 s_Homestead:["বাড়ি","Homestead"],s_Paddy_Field:["ধানি জমি","Paddy field"],s_Shop:["দোকান","Shop"],s_Pond:["পুকুর","Pond"],s_Fallow:["পতিত","Fallow"],s_Garment_Factory:["পোশাক কারখানা","Garment factory"],
 u_dec:["শতাংশ","decimal"],u_acre:["একর","acre"],u_sqm:["বর্গমিটার","sq.m"],
 d_owner:["মালিক","Owner"],d_risk:["ঝুঁকি","Risk"],d_report:["পূর্ণ যাচাই রিপোর্ট","Full verification report"],d_share:["লিংক কপি","Copy link"],d_gmaps:["গুগল ম্যাপে খুলুন","Open in Google Maps"],d_copied:["লিংক কপি হয়েছে","Link copied"],d_addr:["ঠিকানা","Address"],
@@ -1740,7 +1751,9 @@ $('#langSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;lang=b
 $$('.modeSeg').forEach(sg=>sg.onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.mode!==dataMode)switchMode(b.dataset.mode)});
 $('#roleSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;role=b.dataset.role;localStorage.role=role;applyStatic();
   if(role==='admin'&&cur.path.indexOf('/admin')!==0)location.hash='#/admin';else if(role==='user'&&cur.path.indexOf('/admin')===0)location.hash='#/';else route(true)};
-$('#themeBtn').onclick=()=>{const n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.theme=n};
+function syncThemeLogo(theme){const dark=(theme||document.documentElement.dataset.theme)==='dark';const s=document.querySelector('.brand > img:only-child');if(s)s.src=dark?'/assets/logo_dark.png':'/assets/logo.png'}
+$('#themeBtn').onclick=()=>{const n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.theme=n;syncThemeLogo(n)};
+syncThemeLogo();
 $('#burger').onclick=()=>{const collapsed=document.body.classList.toggle('side-nav-collapsed');$('#burger').setAttribute('aria-expanded',String(!collapsed))};
 $$('[data-go]').forEach(e=>e.onclick=()=>{const g=e.dataset.go;if(g==='#/admin'&&role!=='admin'){role='admin';localStorage.role=role;applyStatic()}location.hash=g});
 
@@ -1864,7 +1877,7 @@ function sidebar(){
   lf.forEach(f=>{const c=f.properties.maj_class||'?';(cs[c]??={n:0,a:0}).n++;cs[c].a+=f.properties.area_sqm});
   $('#sub').textContent=(loaded.length?`${loaded.length} ${t('m_loaded')} · ${new Date().toLocaleTimeString(lang==='bn'?'bn-BD':'en-GB')}`:t('m_click_ds'))+(dataMode==='api'?' · API':'');
   $('#mstats').innerHTML=[[pf.length,'m_total'],[lf.length,'m_parts'],[dec(total),'m_area'],[Object.keys(cs).length,'m_cls']].map(([v,k],i)=>`<div><b>${nf(v,i==2?1:0)}</b><span>${t(k)}</span></div>`).join('');
-  $('#legend').innerHTML=Object.entries(cs).map(([c,v])=>`<label class="rw"><input type="checkbox" data-c="${esc(c)}" ${hiddenCls.has(c)?'':'checked'}><span class="sw" style="background:${colorOf(c)}"></span>${esc(cls(c))}<span class="n">${nf(v.n,0)} · ${nf(dec(v.a),1)}</span></label>`).join('')||`<small>${t('m_none')}</small>`;
+  $('#legend').innerHTML=Object.entries(cs).map(([c,v])=>`<label class="rw"><input type="checkbox" data-c="${esc(c)}" ${hiddenCls.has(c)?'':'checked'}><span class="sw" style="background:${colorOf(c)}"></span><span class="lbl">${esc(cls(c))}</span><span class="n">${nf(v.n,0)} · ${nf(dec(v.a),1)}</span></label>`).join('')||`<small>${t('m_none')}</small>`;
   $$('#legend input').forEach(i=>i.onchange=()=>{i.checked?hiddenCls.delete(i.dataset.c):hiddenCls.add(i.dataset.c);renderData()});
   renderList();renderSaved()}
 function renderSaved(){if(dataMode!=='api')return;const a=DSL.filter(d=>d.source==='api');$('#m_fb').hidden=!DSL.some(d=>d.fallback);
