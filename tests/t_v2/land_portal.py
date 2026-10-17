@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ভূমি দর্পণ / Bhumi Dorpon  —  Bangladesh Land Portal  (Flask + Leaflet)  MVP
+আমার ভূমি / Bhumi Dorpon  —  Bangladesh Land Portal  (Flask + Leaflet)  MVP
 ===========================================================================
     pip install flask
     python land_portal.py                 # http://127.0.0.1:5000
@@ -99,11 +99,11 @@ def bn_digits(s):
 
 
 def cur_mode():
-    """'api' or 'dataset' — taken from the request (X-Data-Mode header or ?mode=)."""
+    """'api' or 'dataset' — taken from the request, defaulting to API mode."""
     if not has_request_context():
-        return "dataset"
+        return "api"
     m = request.headers.get("X-Data-Mode") or request.args.get("mode") or ""
-    return "api" if m == "api" else "dataset"
+    return "dataset" if m == "dataset" else "api"
 
 
 # ----------------------------------------------------------------- government map service proxy
@@ -1115,7 +1115,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ভূমি দর্পণ</title>
+<title>আমার ভূমি</title>
 <script>try{document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Noto+Sans+Bengali:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1123,9 +1123,9 @@ PAGE = r"""<!doctype html>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 :root{--nav:64px;--bg:#f3f8f4;--sf:#fff;--sf2:#eef5f0;--tx:#0f2218;--mu:#5a6f62;--ln:#dce8e0;--g:#0b7d4c;--g2:#16a96b;--gt:#e1f4e8;--on:#fff;
---wr:#b45309;--wrt:#fef3c7;--bd:#b91c1c;--bdt:#fee2e2;--sh:0 10px 30px rgba(8,50,30,.10);--glass:rgba(255,255,255,.86)}
+--wr:#b45309;--wrt:#fef3c7;--bd:#b91c1c;--bdt:#fee2e2;--sh:0 10px 30px rgba(8,50,30,.10);--glass:rgba(255,255,255,.86);--top-nav:rgba(255,255,255,.66)}
 [data-theme=dark]{--bg:#07120c;--sf:#0e1d15;--sf2:#13271c;--tx:#e6f3ea;--mu:#8ba596;--ln:#1e3a2b;--g:#34d58f;--g2:#1fb673;--gt:#103223;--on:#04210f;
---wr:#fbbf24;--wrt:#3a2e0b;--bd:#f87171;--bdt:#3b1414;--sh:0 10px 30px rgba(0,0,0,.45);--glass:rgba(14,29,21,.88)}
+--wr:#fbbf24;--wrt:#3a2e0b;--bd:#f87171;--bdt:#3b1414;--sh:0 10px 30px rgba(0,0,0,.45);--glass:rgba(14,29,21,.88);--top-nav:rgba(14,29,21,.72)}
 *{box-sizing:border-box}
 html,body{margin:0;min-height:100%}
 body{font-family:'Inter','Hind Siliguri','Noto Sans Bengali','Nirmala UI','Kalpurush','Vrinda',system-ui,sans-serif;background:var(--bg);color:var(--tx);line-height:1.55;font-size:16px}
@@ -1134,19 +1134,22 @@ h1,h2,h3,h4{margin:0;line-height:1.25}
 [hidden]{display:none!important}
 .container{max-width:1160px;margin:0 auto;padding:0 20px}
 /* nav */
-.nav{position:sticky;top:0;z-index:2000;height:var(--nav);background:var(--glass);backdrop-filter:blur(14px);border-bottom:1px solid var(--ln)}
+.nav{position:sticky;top:0;z-index:2000;height:var(--nav);background:var(--top-nav);backdrop-filter:blur(14px);border-bottom:1px solid var(--ln)}
 .nav-in{height:100%;max-width:1280px;margin:0 auto;padding:0 18px;display:flex;align-items:center;gap:14px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:var(--g)}
 .logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,var(--g),var(--g2));display:grid;place-items:center;font-size:19px}
-.nav-links{display:flex;align-items:center;gap:4px;margin-left:18px;flex:1}
-.nav-links a{padding:8px 13px;border-radius:10px;color:var(--mu);font-weight:500;font-size:15px}
+.nav-links{display:flex;align-items:center;gap:4px;margin-left:18px;flex:1;min-width:0}
+.nav-links a{padding:8px 13px;border-radius:10px;color:var(--mu);font-weight:500;font-size:15px;white-space:nowrap;flex-shrink:0}
 .nav-links a:hover{background:var(--sf2);color:var(--tx)}.nav-links a.on{background:var(--gt);color:var(--g)}
 .tools{display:flex;gap:8px;align-items:center}
 .seg{display:inline-flex;background:var(--sf2);border:1px solid var(--ln);border-radius:11px;padding:3px}
 .seg button{border:0;background:none;color:var(--mu);padding:5px 11px;border-radius:8px;font:inherit;font-size:13px;font-weight:600;cursor:pointer}
+.nav-links button{white-space:nowrap}
 .seg button.on{background:var(--g);color:var(--on)}
 .icon{width:38px;height:38px;border-radius:11px;border:1px solid var(--ln);background:var(--sf);color:var(--tx);cursor:pointer;font-size:17px}
-.burger{display:none}
+.burger{display:inline-flex;align-items:center;justify-content:center}
+#links:not(.open){display:none}
+#links.open{display:flex}
 #roleSeg{margin-left:auto}
 /* buttons / forms */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:11px 18px;border-radius:12px;border:1px solid transparent;background:var(--g);color:var(--on);font:inherit;font-weight:600;font-size:15px;cursor:pointer;transition:.15s}
@@ -1316,7 +1319,9 @@ a:focus-visible,button:focus-visible,.rw:focus-visible{outline:2px solid var(--g
 #ldSteps li.run{color:var(--tx);font-weight:600}#ldSteps li.run:before{border-color:var(--g2);border-top-color:transparent;animation:spin .8s linear infinite}
 #ldSteps li.ok:before{background:var(--g);border-color:var(--g)}#ldSteps li.warn:before{background:var(--wr);border-color:var(--wr)}#ldSteps li.fail:before{background:var(--bd);border-color:var(--bd)}
 @media(max-width:760px){
- .nav-in{padding:0 12px}.tools .modeSeg,.tools .mode-label{display:none}
+ .nav-in{padding:0 12px;position:relative}.tools .modeSeg,.tools .mode-label{display:none}
+ .nav-links{position:absolute;top:calc(var(--nav) - 1px);left:12px;right:12px;margin:0;padding:10px;display:none;flex-direction:column;align-items:stretch;gap:2px;background:var(--glass);border:1px solid var(--ln);border-radius:0 0 14px 14px;box-shadow:var(--sh);backdrop-filter:blur(14px)}
+ #links.open{display:flex}.nav-links a{width:100%}
  .nav-links .modeSeg{display:inline-flex;align-self:flex-start;margin:6px 0 0}
  .tabs{flex-wrap:nowrap;overflow-x:auto;padding-bottom:4px;-webkit-overflow-scrolling:touch}.tabs button{white-space:nowrap}
  .rt thead{display:none}.rt,.rt tbody{display:block}
@@ -1334,28 +1339,62 @@ a:focus-visible,button:focus-visible,.rw:focus-visible{outline:2px solid var(--g
  .container{padding:0 14px}.hero{padding:34px 0 24px}.brand span:last-child{font-size:16px}
 }
 @media(min-width:1400px){.container{max-width:1280px}}
+/* primary navigation layout */
+:root{--side-nav:240px}
+.nav{position:sticky}
+.nav-in{max-width:none}
+.nav-links{position:fixed;z-index:1990;top:var(--nav);left:0;bottom:0;width:var(--side-nav);margin:0;padding:18px 12px;display:flex;flex-direction:column;align-items:stretch;gap:4px;background:var(--glass);border-right:1px solid var(--ln);box-shadow:var(--sh);overflow-y:auto;transition:transform .25s}
+.nav-links a{display:flex;align-items:center;min-height:42px;padding:9px 13px}
+.nav-links .modeSeg{display:none}
+.nav-links #roleSeg{display:none}
+.side-nav-collapsed .nav-links{transform:translateX(-100%)}
+main{margin-left:var(--side-nav);transition:margin-left .25s}
+.side-nav-collapsed main{margin-left:0}
+.avatar{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:var(--gt);color:var(--g);font-size:13px;font-weight:700}
+.tools{margin-left:auto;min-width:0}
+.tools .seg{flex-shrink:0}
+.tools button{white-space:nowrap}
+#roleSeg{margin-left:0}
+.burger{display:inline-flex}
+#links:not(.open){display:flex}
+#links.open{display:flex}
+#v-map{left:var(--side-nav);transition:left .25s}
+.side-nav-collapsed #v-map{left:0}
+@media(max-width:760px){
+ .nav-in{padding:0 12px}
+ .nav-links{top:var(--nav);left:0;right:auto;width:min(280px,86vw);padding:14px 12px;border-radius:0;border-right:1px solid var(--ln)}
+ .side-nav-collapsed .nav-links{transform:translateX(-100%)}
+ main{margin-left:0}
+ #v-map{left:0}
+ .brand span:last-child{font-size:17px}
+}
+@media(max-width:1100px) and (min-width:761px){
+ .brand span:last-child,.mode-label{display:none}
+ .nav-in{gap:8px}
+}
 </style>
 <!--HARDEN-->
 </head>
 <body>
 <header class="nav"><div class="nav-in">
   <a class="brand" href="#/"><span class="logo"><i data-ic="leaf" data-s="20"></i></span><span data-i18n="brand"></span></a>
-  <nav class="nav-links" id="links">
+  <div class="tools">
+    <span class="avatar" aria-hidden="true">U</span>
+    <div class="seg" id="roleSeg"><button data-role="user" data-i18n="role_user"></button><button data-role="admin" data-i18n="role_admin"></button></div>
+    <span class="mode-label" data-i18n="mode_label"></span><div class="seg modeSeg"><button data-mode="dataset" data-i18n="mode_dataset"></button><button data-mode="api" data-i18n="mode_api"></button></div>
+    <div class="seg" id="langSeg"><button data-lang="bn">বাং</button><button data-lang="en">EN</button></div>
+    <button class="icon" id="themeBtn" title="Theme" aria-label="Theme"><i data-ic="contrast" data-s="18"></i></button>
+    <button class="icon burger" id="burger" aria-label="Menu" aria-expanded="true"><i data-ic="menu" data-s="18"></i></button>
+  </div>
+</div></header>
+
+<nav class="nav-links open" id="links" aria-label="Primary navigation">
     <a href="#/" data-r="home" data-i18n="nav_home"></a>
     <a href="#/map" data-r="map" data-i18n="nav_map"></a>
     <a href="#/verify" data-r="verify" data-i18n="nav_verify"></a>
     <a href="#/track" data-r="track" data-i18n="nav_track"></a>
     <a href="#/admin" data-r="admin" id="navAdmin" data-i18n="nav_admin"></a>
-    <div class="seg modeSeg"><button data-mode="dataset" data-i18n="mode_dataset"></button><button data-mode="api" data-i18n="mode_api"></button></div>
-    <div class="seg" id="roleSeg"><button data-role="user" data-i18n="role_user"></button><button data-role="admin" data-i18n="role_admin"></button></div>
-  </nav>
-  <div class="tools">
-    <span class="mode-label" data-i18n="mode_label"></span><div class="seg modeSeg"><button data-mode="dataset" data-i18n="mode_dataset"></button><button data-mode="api" data-i18n="mode_api"></button></div>
-    <div class="seg" id="langSeg"><button data-lang="bn">বাং</button><button data-lang="en">EN</button></div>
-    <button class="icon" id="themeBtn" title="Theme" aria-label="Theme"><i data-ic="contrast" data-s="18"></i></button>
-    <button class="icon burger" id="burger" aria-label="Menu"><i data-ic="menu" data-s="18"></i></button>
-  </div>
-</div></header>
+</nav>
 
 <main>
 <section class="view" id="v-home">
@@ -1500,10 +1539,10 @@ clipboard:'<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h
 clock:'<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
 ban:'<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>'};
 const ico=(n,s=18)=>`<svg class="ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[n]||''}</svg>`;
-let lang=localStorage.lang||'bn',role=localStorage.role||'user',dataMode=localStorage.dataMode==='api'?'api':'dataset';
+let lang=localStorage.lang||'bn',role=localStorage.role||'user',dataMode=localStorage.dataMode==='dataset'?'dataset':'api';
 /* ---------- translations [bn, en] ---------- */
 const T={
-brand:["ভূমি দর্পণ","Bhumi Dorpon"],tagline:["বাংলাদেশ ভূমি তথ্য ও যাচাই","Bangladesh land info & verification"],
+brand:["আমার ভূমি","Bhumi Dorpon"],tagline:["বাংলাদেশ ভূমি তথ্য ও যাচাই","Bangladesh land info & verification"],
 mode_label:["ডেটা উৎস","Data source"],mode_dataset:["ডেমো ডেটা","Dataset"],mode_api:["সরকারি API","Government API"],
 nav_home:["হোম","Home"],nav_map:["ভূমি মানচিত্র","Land map"],nav_verify:["কেনার আগে যাচাই","Pre-purchase check"],nav_track:["নামজারি ট্র্যাকিং","Mutation tracking"],nav_admin:["অ্যাডমিন টুলস","Admin tools"],
 role_user:["ব্যবহারকারী","User"],role_admin:["অ্যাডমিন","Admin"],
@@ -1686,7 +1725,7 @@ $$('.modeSeg').forEach(sg=>sg.onclick=e=>{const b=e.target.closest('button');if(
 $('#roleSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;role=b.dataset.role;localStorage.role=role;applyStatic();
   if(role==='admin'&&cur.path.indexOf('/admin')!==0)location.hash='#/admin';else if(role==='user'&&cur.path.indexOf('/admin')===0)location.hash='#/';else route(true)};
 $('#themeBtn').onclick=()=>{const n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.theme=n};
-$('#burger').onclick=()=>$('#links').classList.toggle('open');
+$('#burger').onclick=()=>{const collapsed=document.body.classList.toggle('side-nav-collapsed');$('#burger').setAttribute('aria-expanded',String(!collapsed))};
 $$('[data-go]').forEach(e=>e.onclick=()=>{const g=e.dataset.go;if(g==='#/admin'&&role!=='admin'){role='admin';localStorage.role=role;applyStatic()}location.hash=g});
 
 /* ---------- router ---------- */
@@ -1694,7 +1733,7 @@ function route(keep){
   const h=location.hash.slice(1)||'/',[path,qs]=h.split('?');cur={path,q:new URLSearchParams(qs||'')};
   const v=path.startsWith('/map')?'map':path.startsWith('/verify')?'verify':path.startsWith('/track')?'track':path.startsWith('/admin')?'admin':'home';
   $$('.view').forEach(e=>e.hidden=e.id!=='v-'+v);document.body.classList.toggle('map-mode',v==='map');
-  $$('.nav-links a').forEach(a=>a.classList.toggle('on',a.dataset.r===v));$('#links').classList.remove('open');
+  $$('.nav-links a').forEach(a=>a.classList.toggle('on',a.dataset.r===v));
   if(v==='home')renderHome();else if(v==='map')showMap(cur.q,keep);else if(v==='verify')renderVerify(keep);else if(v==='track')renderTrack(keep);else renderAdmin();
   if(!keep&&v!=='map')scrollTo(0,0)}
 addEventListener('hashchange',()=>route(false));
@@ -2037,7 +2076,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     HARDEN["on"] = not a.dev
     write_demo()
-    print(f"ভূমি দর্পণ  ->  http://{a.host}:{a.port}   (data folder: {DATA_DIR}, API areas: {API_DIR})")
+    print(f"আমার ভূমি  ->  http://{a.host}:{a.port}   (data folder: {DATA_DIR}, API areas: {API_DIR})")
     if not a.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{a.host}:{a.port}")).start()
     app.run(host=a.host, port=a.port, debug=False, threaded=True)
