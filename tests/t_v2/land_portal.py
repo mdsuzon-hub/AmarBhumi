@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-আমার ভূমি / Bhumi Dorpon  —  Bangladesh Land Portal  (Flask + Leaflet)  MVP
+আমার ভূমি / AmarBhumi  —  Bangladesh Land Portal  (Flask + Leaflet)  MVP
 ===========================================================================
     pip install flask
     python land_portal.py                 # http://127.0.0.1:5000
@@ -1542,7 +1542,7 @@ const ico=(n,s=18)=>`<svg class="ico" width="${s}" height="${s}" viewBox="0 0 24
 let lang=localStorage.lang||'bn',role=localStorage.role||'user',dataMode=localStorage.dataMode==='dataset'?'dataset':'api';
 /* ---------- translations [bn, en] ---------- */
 const T={
-brand:["আমার ভূমি","Bhumi Dorpon"],tagline:["বাংলাদেশ ভূমি তথ্য ও যাচাই","Bangladesh land info & verification"],
+brand:["আমার ভূমি","AmarBhumi"],tagline:["বাংলাদেশ ভূমি তথ্য ও যাচাই","Bangladesh land info & verification"],
 mode_label:["ডেটা উৎস","Data source"],mode_dataset:["ডেমো ডেটা","Dataset"],mode_api:["সরকারি API","Government API"],
 nav_home:["হোম","Home"],nav_map:["ভূমি মানচিত্র","Land map"],nav_verify:["কেনার আগে যাচাই","Pre-purchase check"],nav_track:["নামজারি ট্র্যাকিং","Mutation tracking"],nav_admin:["অ্যাডমিন টুলস","Admin tools"],
 role_user:["ব্যবহারকারী","User"],role_admin:["অ্যাডমিন","Admin"],

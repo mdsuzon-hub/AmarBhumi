@@ -1,0 +1,42 @@
+{
+ "tool": "MouzaMap Digitizer 0.1.0",
+ "exported_at": "2026-10-17T03:38:41+00:00",
+ "coordinate_system": "local image pixel coordinates (NOT georeferenced, no CRS)",
+ "coordinate_note": "Coordinates are IMAGE PIXEL coordinates, NOT geographic coordinates. Origin is the top-left corner of the image; one unit equals one image pixel; vertices lie on pixel corners (continuous coordinates). No CRS is assigned. Georeference these polygons before using them as map data.",
+ "coordinate_space": "working",
+ "units": "pixels",
+ "origin": "bottom-left (y axis flipped: y = image_height - y_pixel)",
+ "flip_y": true,
+ "image_width": 2680,
+ "image_height": 2020,
+ "source_path": "/home/claude/mouzamap_digitizer/samples/sample_mouza_map.pdf",
+ "source_page": 1,
+ "dpi": 300,
+ "rotation_deg": 0.0,
+ "crop_xywh": [
+  200,
+  270,
+  2680,
+  2020
+ ],
+ "source_to_working_matrix": [
+  [
+   1.0,
+   0.0,
+   -200.0
+  ],
+  [
+   0.0,
+   1.0,
+   -270.0
+  ],
+  [
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "crs": null,
+ "affine": null,
+ "parcel_count": 49
+}
