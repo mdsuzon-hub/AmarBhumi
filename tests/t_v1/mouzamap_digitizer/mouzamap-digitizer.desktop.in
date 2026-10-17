@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=MouzaMap Digitizer
+GenericName=Cadastral map digitizer
+Comment=Extract land-parcel polygons from scanned mouza maps
+Exec=@INSTALL_DIR@/run.sh %F
+Icon=@INSTALL_DIR@/resources/mouzamap-digitizer.svg
+Terminal=false
+Categories=Graphics;Science;Geography;
+MimeType=application/pdf;image/png;image/jpeg;image/tiff;
+StartupNotify=true

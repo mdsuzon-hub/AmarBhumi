@@ -1,0 +1,13 @@
+# MouzaMap Digitizer - runtime dependencies (Python 3.11+)
+# PySide6-Essentials provides the same `PySide6` module as PySide6 (QtWidgets etc.) with a smaller download.
+# opencv-python-headless is used on purpose: the non-headless wheel bundles its own Qt plugins that clash with PySide6.
+numpy>=1.26
+opencv-python-headless>=4.9
+PySide6-Essentials>=6.6
+PyMuPDF>=1.24
+shapely>=2.0
+geopandas>=0.14
+pyogrio>=0.7
+rasterio>=1.3
+pyproj>=3.6
+Pillow>=10.0
