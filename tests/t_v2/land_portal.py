@@ -24,12 +24,14 @@ Ownership, cases, fraud alerts and mutation workflow are DUMMY data (determinist
 """
 import argparse
 import hashlib
+import hmac
 import json
 import math
 import os
 import random
 import re
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,7 +49,34 @@ os.makedirs(API_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 TODAY = date.today()
-STATE = {"fraud": {}, "wf": {}}  # in-memory admin actions (MVP)
+CUSTOM_FILE = os.path.join(DATA_DIR, "admin_custom.json")
+STATE = {"fraud": {}, "wf": {}, "rev": {"dataset": 0, "api": 0},
+         "custom": {m: {"alerts": {}, "cases": {}} for m in ("dataset", "api")}}
+ADMIN_KEY = os.environ.get("BD_ADMIN_KEY", "")
+HARDEN = {"on": True}
+
+
+def _load_custom():
+    """Manually added fraud alerts / mutation cases survive restarts (kept per data mode)."""
+    try:
+        with open(CUSTOM_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        for m in ("dataset", "api"):
+            for k in ("alerts", "cases"):
+                STATE["custom"][m][k] = dict((raw.get(m) or {}).get(k) or {})
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _touch(mode):
+    STATE["rev"][mode] += 1
+    tmp = CUSTOM_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(STATE["custom"], f, ensure_ascii=False)
+    os.replace(tmp, CUSTOM_FILE)
+
+
+_load_custom()
 
 BD_MAP_URL = os.environ.get("BD_MAP_URL", "https://map.land.gov.bd")
 _bd_session = {"token": None, "cookies": None}
@@ -448,8 +477,9 @@ _der = {}
 
 def derived():
     idx, mode = index(), cur_mode()
+    dsig = f"{idx['sig']}:{STATE['rev'][mode]}"
     c = _der.get(mode)
-    if c and c["sig"] == idx["sig"]:
+    if c and c["sig"] == dsig:
         return c
     alerts, by_plot = {}, {}
     for key, pl in idx["plots"].items():
@@ -469,6 +499,10 @@ def derived():
              "evidence": alert_evidence(scen, rng, area_dec)}
         alerts[aid] = a
         by_plot.setdefault(key, []).append(a)
+    for aid, a in STATE["custom"][mode]["alerts"].items():  # manually added by admin
+        if (a["ds"], a["plot_no"]) in idx["plots"]:
+            alerts[aid] = a
+            by_plot.setdefault((a["ds"], a["plot_no"]), []).append(a)
     cases, n = {}, 0
     prefix = "API" if mode == "api" else "MUT"
     for key, pl in idx["plots"].items():
@@ -504,8 +538,12 @@ def derived():
             "created": created.isoformat(), "sla_due": (created + timedelta(days=28)).isoformat(),
             "stage": stage, "status": status, "timeline": tl,
             "checks": [{"key": k, "level": v if stage >= 1 else "queued"} for k, v in checks],
+            "raw": [[k, v] for k, v in checks],
         }
-    _der[mode] = {"sig": idx["sig"], "alerts": alerts, "cases": cases, "by_plot": by_plot}
+    for cid, c in STATE["custom"][mode]["cases"].items():
+        if (c["ds"], c["plot_no"]) in idx["plots"]:
+            cases[cid] = c
+    _der[mode] = {"sig": dsig, "alerts": alerts, "cases": cases, "by_plot": by_plot}
     return _der[mode]
 
 
@@ -530,6 +568,8 @@ def case_view(c):
     st = STATE["wf"].get(c["id"])
     if st:
         v.update(stage=st["stage"], status=st["status"], timeline=c["timeline"] + st["log"])
+    if v.get("raw"):  # automated checks become visible once the case leaves "registration"
+        v["checks"] = [{"key": k, "level": lv if v["stage"] >= 1 else "queued"} for k, lv in v["raw"]]
     v["days_left"] = (date.fromisoformat(c["sla_due"]) - TODAY).days
     return v
 
@@ -602,6 +642,21 @@ def record(key):
 # ----------------------------------------------------------------- API
 def err(msg, code=400):
     return jsonify(error=msg), code
+
+
+@app.before_request
+def _admin_guard():
+    if ADMIN_KEY and request.path.startswith("/api/admin/"):
+        if not hmac.compare_digest(request.headers.get("X-Admin-Key", ""), ADMIN_KEY):
+            return err("admin key required / অ্যাডমিন কী প্রয়োজন", 401)
+
+
+@app.after_request
+def _sec_headers(r):
+    r.headers.setdefault("X-Content-Type-Options", "nosniff")
+    r.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    r.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return r
 
 
 @app.route("/api/datasets")
@@ -851,11 +906,137 @@ def api_admin_wf_set(cid):
             return err("blocked: flagged/closed — release first / আটকানো বা বন্ধ — আগে ছাড় দিন", 409)
         st["stage"] = min(5, st["stage"] + 1)
         st["status"] = "completed" if st["stage"] == 5 else "ok"
+        if st["stage"] == 1 and any(lv != "pass" for k, lv in (c.get("raw") or []) if k != "fee_paid"):
+            st["status"] = "flagged"  # automated checks failed -> needs an officer
         st["log"].append({"date": TODAY.isoformat(), "key": STAGES[st["stage"]]})
     else:
         st["status"] = {"hold": "flagged", "release": "ok", "reject": "rejected"}[act]
         st["log"].append({"date": TODAY.isoformat(), "key": act})
     return jsonify(case=case_view(c))
+
+
+def _plot_key(b):
+    key = (str(b.get("ds", "")).strip().lower(), str(b.get("plot_no", "")).strip())
+    return key if key in index()["plots"] else None
+
+
+def _free_id(fmt, exists):
+    n = zlib.crc32(str(time.time_ns()).encode()) % 90000 + 10000
+    while exists(fmt(n)):
+        n = n + 1 if n < 99999 else 10000
+    return fmt(n)
+
+
+@app.route("/api/admin/fraud", methods=["POST"])
+def api_admin_fraud_create():
+    """Admin adds a fraud alert on any plot of the active data mode."""
+    b = request.get_json(silent=True) or {}
+    key, typ = _plot_key(b), b.get("type")
+    if not key:
+        return err("plot not found in this dataset / এই ডেটাসেটে দাগ পাওয়া যায়নি", 404)
+    if typ not in FRAUD_TYPES:
+        return err("invalid fraud type / জালিয়াতির ধরন সঠিক নয়")
+    mode, (ds, no) = cur_mode(), key
+    pl = index()["plots"][key]
+    sev = b.get("severity")
+    if sev not in ("high", "medium"):
+        sev = "high" if typ in ("fake_deed", "double_sale") else "medium"
+    try:
+        conf = max(1, min(99, int(b.get("confidence", 85))))
+    except (TypeError, ValueError):
+        conf = 85
+    note = str(b.get("note") or "").strip()[:300]
+    taken, store = derived()["alerts"], STATE["custom"][mode]["alerts"]
+    aid = _free_id(lambda n: f"FR-C{n}", lambda i: i in taken or i in store)
+    evidence = alert_evidence(typ, random.Random(aid), pl["props"]["area_sqm"] / 40.4686)
+    if note:
+        evidence.append(_ev(note, note))
+    d, s, bn, en = label_of(ds)
+    store[aid] = {"id": aid, "type": typ, "severity": sev, "ds": ds, "plot_no": no,
+                  "label": pl["props"].get("label", no), "sheet": s, "district": {"bn": bn, "en": en},
+                  "confidence": conf, "detected": TODAY.isoformat(), "default_status": "new",
+                  "evidence": evidence, "custom": True, "note": note}
+    _touch(mode)
+    return jsonify(ok=True, alert=alert_view(store[aid]))
+
+
+@app.route("/api/admin/fraud/<aid>", methods=["DELETE"])
+def api_admin_fraud_delete(aid):
+    mode = cur_mode()
+    if aid not in STATE["custom"][mode]["alerts"]:
+        return err("only manually added alerts can be removed / শুধু ম্যানুয়ালি যোগ করা সতর্কতা মোছা যায়", 404)
+    STATE["custom"][mode]["alerts"].pop(aid)
+    STATE["fraud"].pop(aid, None)
+    _touch(mode)
+    return jsonify(ok=True)
+
+
+@app.route("/api/admin/workflow", methods=["POST"])
+def api_admin_wf_create():
+    """Admin opens an e-Mutation case for any plot of the active data mode (starts at 'registration')."""
+    b = request.get_json(silent=True) or {}
+    key = _plot_key(b)
+    if not key:
+        return err("plot not found in this dataset / এই ডেটাসেটে দাগ পাওয়া যায়নি", 404)
+    mode, (ds, no) = cur_mode(), key
+    pl, dr = index()["plots"][key], derived()
+    store = STATE["custom"][mode]["cases"]
+    prefix = "API" if mode == "api" else "MUT"
+    cid = _free_id(lambda n: f"{prefix}-{TODAY.year}-{n:05d}", lambda i: i in dr["cases"] or i in store)
+    rng = random.Random(cid)
+
+    def who(v):
+        v = str(v or "").strip()[:80]
+        return {"bn": v, "en": v} if v else person(rng)
+
+    try:
+        dd = date.fromisoformat(str(b.get("deed_date") or "")[:10])
+    except ValueError:
+        dd = TODAY
+    dd = min(dd, TODAY)
+    deed_no = str(b.get("deed_no") or "").strip()[:30] or f"{rng.randint(1000, 9999)}/{dd.year}"
+    ft = {a["type"] for a in dr["by_plot"].get(key, [])}
+    raw = [[k, v] for k, v in wf_checks(scenario(ds, pl["idx"]), ft)]
+    d, s, bn, en = label_of(ds)
+    store[cid] = {
+        "id": cid, "ds": ds, "plot_no": no, "label": pl["props"].get("label", no), "sheet": s,
+        "district": {"bn": bn, "en": en}, "buyer": who(b.get("buyer")), "seller": who(b.get("seller")),
+        "deed_no": deed_no, "deed_date": dd.isoformat(),
+        "office": {"bn": f"{bn} সাব-রেজিস্ট্রি অফিস", "en": f"{en} Sub-Registry Office"},
+        "created": TODAY.isoformat(), "sla_due": (TODAY + timedelta(days=28)).isoformat(),
+        "stage": 0, "status": "ok", "timeline": [{"date": TODAY.isoformat(), "key": "registration"}],
+        "checks": [{"key": k, "level": "queued"} for k, _ in raw], "raw": raw, "custom": True,
+    }
+    _touch(mode)
+    return jsonify(ok=True, case=case_view(store[cid]))
+
+
+@app.route("/api/admin/workflow/<cid>", methods=["DELETE"])
+def api_admin_wf_delete(cid):
+    mode = cur_mode()
+    if cid not in STATE["custom"][mode]["cases"]:
+        return err("only manually added cases can be removed / শুধু ম্যানুয়ালি যোগ করা কেস মোছা যায়", 404)
+    STATE["custom"][mode]["cases"].pop(cid)
+    STATE["wf"].pop(cid, None)
+    _touch(mode)
+    return jsonify(ok=True)
+
+
+HARDEN_HTML = r"""
+<style>body.locked,body.locked *{-webkit-user-select:none;user-select:none}body.locked input,body.locked select,body.locked textarea,body.locked .sel{-webkit-user-select:text;user-select:text}img,svg{-webkit-user-drag:none}</style>
+<script src="https://cdn.jsdelivr.net/npm/disable-devtool@0.3.7/disable-devtool.min.js"></script>
+<script>
+(function(){
+  var stop=function(e){e.preventDefault();e.stopPropagation();return false};
+  var lock=function(){try{document.body.innerHTML='<div style="font:600 18px/1.8 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;text-align:center;padding:24px">Developer tools are not allowed on this page. Close them to continue.<br>ডেভেলপার টুল ব্যবহার করা যাবে না। বন্ধ করে চালিয়ে যান।</div>'}catch(e){}};
+  document.addEventListener('DOMContentLoaded',function(){document.body.classList.add('locked')});
+  addEventListener('contextmenu',stop,true);addEventListener('dragstart',stop,true);
+  addEventListener('keydown',function(e){var c=e.ctrlKey||e.metaKey,k=e.code||'';
+    if(k==='F12'||(c&&e.shiftKey&&/^Key[IJCKE]$/.test(k))||(c&&e.altKey&&/^Key[IJCU]$/.test(k))||(c&&/^Key[US]$/.test(k)))stop(e)},true);
+  if(window.DisableDevtool)DisableDevtool({disableMenu:true,clearLog:true,interval:400,ondevtoolopen:function(){lock()},ondevtoolclose:function(){location.reload()}});
+})();
+</script>
+"""
 
 
 @app.route("/api/admin/upload/<ds>/<kind>", methods=["POST"])
@@ -881,7 +1062,7 @@ def admin_redirect():
 
 @app.route("/")
 def index_page():
-    return Response(PAGE, mimetype="text/html")
+    return Response(PAGE.replace("<!--HARDEN-->", HARDEN_HTML if HARDEN["on"] else ""), mimetype="text/html")
 
 
 # ----------------------------------------------------------------- demo data
@@ -937,7 +1118,7 @@ PAGE = r"""<!doctype html>
 <title>ভূমি দর্পণ</title>
 <script>try{document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Noto+Sans+Bengali:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -947,7 +1128,7 @@ PAGE = r"""<!doctype html>
 --wr:#fbbf24;--wrt:#3a2e0b;--bd:#f87171;--bdt:#3b1414;--sh:0 10px 30px rgba(0,0,0,.45);--glass:rgba(14,29,21,.88)}
 *{box-sizing:border-box}
 html,body{margin:0;min-height:100%}
-body{font-family:'Hind Siliguri','Inter',system-ui,sans-serif;background:var(--bg);color:var(--tx);line-height:1.55;font-size:16px}
+body{font-family:'Inter','Hind Siliguri','Noto Sans Bengali','Nirmala UI','Kalpurush','Vrinda',system-ui,sans-serif;background:var(--bg);color:var(--tx);line-height:1.55;font-size:16px}
 a{color:inherit;text-decoration:none}
 h1,h2,h3,h4{margin:0;line-height:1.25}
 [hidden]{display:none!important}
@@ -1098,9 +1279,7 @@ body.map-mode footer{display:none}
 #loader{position:fixed;inset:0;z-index:6000;background:rgba(0,0,0,.55);display:grid;place-items:center}
 #loader .card{width:min(420px,92vw)}.pbar{height:8px;background:var(--sf2);border-radius:6px;overflow:hidden;margin:12px 0}
 .pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--g),var(--g2));transition:width .3s}
-#ldSteps{list-style:none;margin:0 0 12px;padding:0}#ldSteps li{padding:5px 0;color:var(--mu)}#ldSteps li:before{content:'○ '}
-#ldSteps li.run{color:var(--tx);font-weight:600}#ldSteps li.run:before{content:'⏳ '}
-#ldSteps li.ok:before{content:'✓ ';color:var(--g)}#ldSteps li.warn:before{content:'! ';color:var(--wr)}#ldSteps li.fail:before{content:'✕ ';color:var(--bd)}
+
 @media(max-width:960px){.hero-in{grid-template-columns:1fr}.hero-art{display:none}.stats{grid-template-columns:repeat(3,1fr)}.grid4{grid-template-columns:repeat(2,1fr)}.grid3{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(3,1fr)}.formrow{grid-template-columns:1fr 1fr}}
 @media(max-width:760px){.burger{display:block}.nav-links{display:none;position:absolute;top:var(--nav);left:0;right:0;background:var(--sf);border-bottom:1px solid var(--ln);flex-direction:column;align-items:stretch;padding:10px;margin:0}
 .nav-links.open{display:flex}#roleSeg{margin:6px 0 0;align-self:flex-start}.brand span:last-child{font-size:17px}
@@ -1108,24 +1287,73 @@ body.map-mode footer{display:none}
 #panel{width:auto;right:12px;bottom:auto;max-height:46%}#panel.hide{transform:translateY(-120%)}#ptoggle{left:auto;right:12px;top:auto;bottom:12px}#panel.hide+#ptoggle{left:auto}
 #drawer{top:auto;left:12px;right:12px;bottom:12px;width:auto;max-height:50%}.fabs{bottom:auto;top:calc(46% + 24px)}}
 @media print{.nav,.btnrow,#toast,footer,.tabs{display:none!important}.view:not(#v-verify){display:none!important}body{background:#fff}}
+
+/* ===== v2: typography, icons, responsive admin ===== */
+body{text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;font-kerning:normal;font-feature-settings:"kern" 1,"liga" 1,"locl" 1;overflow-wrap:break-word;-webkit-text-size-adjust:100%}
+h1,h2,h3,h4{line-height:1.35}
+input,select,textarea,button{font-family:inherit;line-height:1.5}
+textarea{font:inherit;color:var(--tx);background:var(--sf2);border:1px solid var(--ln);border-radius:11px;padding:10px 12px;width:100%;outline:none;resize:vertical;min-height:84px}
+textarea:focus{border-color:var(--g2);box-shadow:0 0 0 3px color-mix(in srgb,var(--g2) 22%,transparent)}
+html[lang=bn] body{line-height:1.75}
+html[lang=bn] *{letter-spacing:0!important;text-transform:none!important}
+html[lang=bn] .badge,html[lang=bn] .tag,html[lang=bn] .chip,html[lang=bn] .fchip{line-height:1.7;padding-top:3px;padding-bottom:3px}
+html[lang=bn] .btn,html[lang=bn] .seg button{line-height:1.6}
+html[lang=bn] th{font-size:13px}
+.ico{flex:none;vertical-align:-3px;display:inline-block}
+[data-ic]{display:inline-flex;align-items:center;justify-content:center;line-height:0}
+.icon{display:inline-grid;place-items:center;padding:0;transition:.15s}.icon:hover{background:var(--sf2)}
+.logo{color:var(--on)}.ck i svg{display:block}.feat .ic{color:var(--g)}
+.float{display:flex;align-items:center;gap:8px}
+.toolbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}.toolbar .filters{margin:0}
+.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.fgrid .full{grid-column:1/-1}
+.formrow.up{grid-template-columns:1fr 1fr 1fr auto}
+.modeSeg{display:inline-flex}.nav-links .modeSeg{display:none}
+dialog{overflow:auto}
+a:focus-visible,button:focus-visible,.rw:focus-visible{outline:2px solid var(--g2);outline-offset:2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+#ldSteps{list-style:none;margin:0 0 12px;padding:0}#ldSteps li{padding:5px 0;color:var(--mu)}
+#ldSteps li:before{content:'';display:inline-block;width:11px;height:11px;border-radius:50%;border:2px solid var(--ln);margin-right:10px;vertical-align:middle}
+#ldSteps li.run{color:var(--tx);font-weight:600}#ldSteps li.run:before{border-color:var(--g2);border-top-color:transparent;animation:spin .8s linear infinite}
+#ldSteps li.ok:before{background:var(--g);border-color:var(--g)}#ldSteps li.warn:before{background:var(--wr);border-color:var(--wr)}#ldSteps li.fail:before{background:var(--bd);border-color:var(--bd)}
+@media(max-width:760px){
+ .nav-in{padding:0 12px}.tools .modeSeg,.tools .mode-label{display:none}
+ .nav-links .modeSeg{display:inline-flex;align-self:flex-start;margin:6px 0 0}
+ .tabs{flex-wrap:nowrap;overflow-x:auto;padding-bottom:4px;-webkit-overflow-scrolling:touch}.tabs button{white-space:nowrap}
+ .rt thead{display:none}.rt,.rt tbody{display:block}
+ .rt tr.r{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;padding:12px;border-bottom:1px solid var(--ln)}
+ .rt td{border:0;padding:0;display:block;min-width:0}
+ .rt td[data-l]:before{content:attr(data-l);display:block;font-size:11.5px;color:var(--mu)}
+ .rt tr.det{display:block;padding:0 12px 12px;border-bottom:1px solid var(--ln)}.rt tr.det td{display:block}
+ .rt td select{width:100%}
+ .board{grid-auto-columns:minmax(80vw,1fr);scroll-snap-type:x mandatory}.col{scroll-snap-align:start}
+ .formrow,.formrow.up,.fgrid{grid-template-columns:1fr}
+ .phead h1{font-size:24px}.card{padding:16px}.toolbar .btn{width:100%}
+}
+@media(max-width:560px){
+ dialog{width:100%;max-width:100%;margin:auto 0 0;border-radius:22px 22px 0 0;max-height:92vh}
+ .container{padding:0 14px}.hero{padding:34px 0 24px}.brand span:last-child{font-size:16px}
+}
+@media(min-width:1400px){.container{max-width:1280px}}
 </style>
+<!--HARDEN-->
 </head>
 <body>
 <header class="nav"><div class="nav-in">
-  <a class="brand" href="#/"><span class="logo">🌿</span><span data-i18n="brand"></span></a>
+  <a class="brand" href="#/"><span class="logo"><i data-ic="leaf" data-s="20"></i></span><span data-i18n="brand"></span></a>
   <nav class="nav-links" id="links">
     <a href="#/" data-r="home" data-i18n="nav_home"></a>
     <a href="#/map" data-r="map" data-i18n="nav_map"></a>
     <a href="#/verify" data-r="verify" data-i18n="nav_verify"></a>
     <a href="#/track" data-r="track" data-i18n="nav_track"></a>
     <a href="#/admin" data-r="admin" id="navAdmin" data-i18n="nav_admin"></a>
+    <div class="seg modeSeg"><button data-mode="dataset" data-i18n="mode_dataset"></button><button data-mode="api" data-i18n="mode_api"></button></div>
     <div class="seg" id="roleSeg"><button data-role="user" data-i18n="role_user"></button><button data-role="admin" data-i18n="role_admin"></button></div>
   </nav>
   <div class="tools">
-    <span class="mode-label" data-i18n="mode_label"></span><div class="seg" id="modeSeg"><button data-mode="dataset" data-i18n="mode_dataset"></button><button data-mode="api" data-i18n="mode_api"></button></div>
+    <span class="mode-label" data-i18n="mode_label"></span><div class="seg modeSeg"><button data-mode="dataset" data-i18n="mode_dataset"></button><button data-mode="api" data-i18n="mode_api"></button></div>
     <div class="seg" id="langSeg"><button data-lang="bn">বাং</button><button data-lang="en">EN</button></div>
-    <button class="icon" id="themeBtn" title="Theme">🌓</button>
-    <button class="icon burger" id="burger">☰</button>
+    <button class="icon" id="themeBtn" title="Theme" aria-label="Theme"><i data-ic="contrast" data-s="18"></i></button>
+    <button class="icon burger" id="burger" aria-label="Menu"><i data-ic="menu" data-s="18"></i></button>
   </div>
 </div></header>
 
@@ -1156,19 +1384,19 @@ body.map-mode footer{display:none}
         </div>
         <div class="btnrow"><button class="btn" id="h_map" data-i18n="btn_map"></button><button class="btn alt" id="h_ver" data-i18n="btn_verify"></button></div>
         <div class="or"><span data-i18n="or_place"></span></div>
-        <div class="placebox"><input id="h_place" data-ph="place_ph"><button class="btn" id="h_go">📍</button></div>
+        <div class="placebox"><input id="h_place" data-ph="place_ph"><button class="btn" id="h_go" aria-label="Search"><i data-ic="pin" data-s="18"></i></button></div>
       </div>
     </div>
     <div class="hero-art"><div class="mock"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-      <div class="float f1">✓ <span data-i18n="mock_safe"></span></div><div class="float f2">⚠ <span data-i18n="mock_alert"></span></div></div>
+      <div class="float f1"><i data-ic="shield" data-s="18"></i> <span data-i18n="mock_safe"></span></div><div class="float f2"><i data-ic="alert" data-s="18"></i> <span data-i18n="mock_alert"></span></div></div>
   </div></div>
   <div class="container stats" id="h_stats"></div>
   <div class="sec"><div class="container"><h2 data-i18n="feat_h"></h2><p data-i18n="feat_p"></p>
     <div class="grid4">
-      <div class="card feat" data-go="#/map"><div class="ic">🗺️</div><h3 data-i18n="feat_map_t"></h3><p data-i18n="feat_map_d"></p></div>
-      <div class="card feat" data-go="#/verify"><div class="ic">🔎</div><h3 data-i18n="feat_ver_t"></h3><p data-i18n="feat_ver_d"></p></div>
-      <div class="card feat" data-go="#/track"><div class="ic">📑</div><h3 data-i18n="feat_mut_t"></h3><p data-i18n="feat_mut_d"></p></div>
-      <div class="card feat" data-go="#/admin"><div class="ic">🛡️</div><h3 data-i18n="feat_fraud_t"></h3><p data-i18n="feat_fraud_d"></p></div>
+      <div class="card feat" data-go="#/map"><div class="ic"><i data-ic="map" data-s="24"></i></div><h3 data-i18n="feat_map_t"></h3><p data-i18n="feat_map_d"></p></div>
+      <div class="card feat" data-go="#/verify"><div class="ic"><i data-ic="search" data-s="24"></i></div><h3 data-i18n="feat_ver_t"></h3><p data-i18n="feat_ver_d"></p></div>
+      <div class="card feat" data-go="#/track"><div class="ic"><i data-ic="file" data-s="24"></i></div><h3 data-i18n="feat_mut_t"></h3><p data-i18n="feat_mut_d"></p></div>
+      <div class="card feat" data-go="#/admin"><div class="ic"><i data-ic="shield" data-s="24"></i></div><h3 data-i18n="feat_fraud_t"></h3><p data-i18n="feat_fraud_d"></p></div>
     </div></div></div>
   <div class="container"><div class="band"><h2 data-i18n="fraud_h"></h2><div class="grid4">
     <div><h4 data-i18n="ft_fake_deed"></h4><p data-i18n="ftd_fake_deed"></p></div>
@@ -1214,8 +1442,8 @@ body.map-mode footer{display:none}
       <h4 data-i18n="m_base"></h4><div class="chips" id="bases"></div>
     </div>
   </aside>
-  <button class="icon" id="ptoggle">☰</button>
-  <div class="fabs"><button class="icon" id="locate" title="My location">📍</button></div>
+  <button class="icon" id="ptoggle" aria-label="Panel"><i data-ic="layers" data-s="18"></i></button>
+  <div class="fabs"><button class="icon" id="locate" title="My location" aria-label="My location"><i data-ic="locate" data-s="18"></i></button></div>
   <div id="drawer" hidden></div>
 </section>
 
@@ -1245,6 +1473,33 @@ body.map-mode footer{display:none}
 <script>
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const BN='০১২৩৪৫৬৭৮৯';
+const IC={
+leaf:'<path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/><path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/>',
+map:'<polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/><line x1="9" x2="9" y1="3" y2="18"/><line x1="15" x2="15" y1="6" y2="21"/>',
+search:'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+shield:'<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+file:'<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>',
+pin:'<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
+check:'<path d="M20 6 9 17l-5-5"/>',
+okc:'<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/>',
+alert:'<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+printer:'<path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3h12v6"/><rect x="6" y="14" width="12" height="8" rx="1"/>',
+link:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+globe:'<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>',
+lock:'<rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+menu:'<path d="M4 12h16"/><path d="M4 6h16"/><path d="M4 18h16"/>',
+contrast:'<circle cx="12" cy="12" r="10"/><path d="M12 18a6 6 0 0 0 0-12v12z"/>',
+play:'<polygon points="6 3 20 12 6 21 6 3"/>',
+pause:'<rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/>',
+trash:'<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
+plus:'<path d="M5 12h14"/><path d="M12 5v14"/>',
+locate:'<line x1="2" x2="5" y1="12" y2="12"/><line x1="19" x2="22" y1="12" y2="12"/><line x1="12" x2="12" y1="2" y2="5"/><line x1="12" x2="12" y1="19" y2="22"/><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/>',
+layers:'<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>',
+clipboard:'<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11h4"/><path d="M12 16h4"/><path d="M8 11h.01"/><path d="M8 16h.01"/>',
+clock:'<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+ban:'<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>'};
+const ico=(n,s=18)=>`<svg class="ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[n]||''}</svg>`;
 let lang=localStorage.lang||'bn',role=localStorage.role||'user',dataMode=localStorage.dataMode==='api'?'api':'dataset';
 /* ---------- translations [bn, en] ---------- */
 const T={
@@ -1280,7 +1535,7 @@ m_nav:["নেভিগেশন","Navigate"],m_overview:["সব এলাক�
 m_plots:["দাগ তালিকা","Plots"],m_classes:["ভূমির ধরন","Land-use classes"],m_layers:["লেয়ার","Layers"],m_ly_land:["ভূমি ব্যবহার","Land use"],m_ly_plot:["দাগের সীমানা","Plot boundaries"],m_labels:["দাগ নম্বর লেবেল","Plot labels"],
 m_autoload:["জুম করলে স্বয়ংক্রিয় লোড","Auto-load on zoom"],m_auto:["ফাইল বদলালে অটো-রিফ্রেশ","Auto-refresh on file change"],m_opacity:["স্বচ্ছতা","Opacity"],m_base:["বেস ম্যাপ","Base map"],
 m_total:["মোট দাগ","Plots"],m_parts:["ভূমি অংশ","Land parts"],m_area:["মোট আয়তন (শতাংশ)","Total (decimal)"],m_cls:["ধরন","Classes"],
-m_click_ds:["লোড করতে ক্লিক করুন","Click to load"],m_none:["কোনো ডেটা নেই","No data"],m_refreshed:["ডেটা হালনাগাদ হয়েছে ✔","Data refreshed ✔"],m_loaded:["লোড হয়েছে","loaded"],m_nodata:["কিছু পাওয়া যায়নি","Nothing found"],
+m_click_ds:["লোড করতে ক্লিক করুন","Click to load"],m_none:["কোনো ডেটা নেই","No data"],m_refreshed:["ডেটা হালনাগাদ হয়েছে","Data refreshed"],m_loaded:["লোড হয়েছে","loaded"],m_nodata:["কিছু পাওয়া যায়নি","Nothing found"],
 m_locating:["অবস্থান খোঁজা হচ্ছে…","Locating…"],m_here:["আপনার অবস্থান","You are here"],m_place_hit:["এলাকায় ডেটাসেট পাওয়া গেছে — লোড হচ্ছে","Dataset found nearby — loading"],
 bm_sat:["স্যাটেলাইট","Satellite"],bm_satl:["স্যাটেলাইট + লেবেল","Satellite + labels"],bm_osm:["ওএসএম","OSM"],bm_topo:["ভূসংস্থান","Topo"],bm_light:["হালকা","Light"],bm_dark:["গাঢ়","Dark"],
 c_Settlement:["বসতবাড়ি","Settlement"],c_Agriculture:["কৃষি","Agriculture"],c_Commercial_Area:["বাণিজ্যিক","Commercial"],c_Water_Body:["জলাশয়","Water body"],c_Road:["সড়ক","Road"],c_Industrial_Area:["শিল্প এলাকা","Industrial"],c_Forest:["বন","Forest"],c_Vacant_Land:["পতিত জমি","Vacant land"],
@@ -1319,7 +1574,7 @@ a_evidence:["প্রমাণ / সংকেত","Evidence / signals"],a_advan
 a_upload_h:["নতুন ডেটাসেট আপলোড","Upload dataset"],a_upload_help:["নাম দিন জেলা_শিট আকারে (যেমন gazipur_002), তারপর land ও plot JSON বেছে নিন। ফাইল data/ ফোল্ডারে জমা হবে এবং মানচিত্রে স্বয়ংক্রিয় যোগ হবে।","Name it district_sheet (e.g. gazipur_002), then choose land and plot JSON. Files are saved in data/ and appear on the map automatically."],
 a_name:["ডেটাসেটের নাম","Dataset name"],a_land_f:["land.json ফাইল","land.json file"],a_plot_f:["plot.json ফাইল","plot.json file"],a_upload_btn:["আপলোড","Upload"],a_uploaded:["আপলোড সম্পন্ন","Uploaded"],a_pick:["অন্তত একটি ফাইল বেছে নিন","Choose at least one file"],
 a_gate_t:["অ্যাডমিন মোড বন্ধ আছে","Admin mode is off"],a_gate_d:["অ্যাডমিন টুল দেখতে ওপরের সুইচ থেকে অ্যাডমিন বেছে নিন। (MVP-তে লগইন নেই)","Switch to Admin using the toggle above to see admin tools. (No login in the MVP)"],a_enable:["অ্যাডমিন মোড চালু করুন","Enable admin mode"],
-ld_title:["সরকারি API থেকে এলাকা লোড হচ্ছে","Loading area from government API"],ld_dist:["জেলার সীমানা","District boundary"],ld_thana:["থানার সীমানা","Thana boundary"],ld_plots:["দাগের ডেটা","Plot data"],ld_land:["ভূমি ব্যবহারের ডেটা","Land-use data"],ld_save:["সংরক্ষণ ও সূচক তৈরি","Saving & indexing"],ld_cached:["সংরক্ষিত এলাকা থেকে লোড হয়েছে","Loaded from saved area"],ld_nocode:["এই মৌজার ম্যাপ কোড নেই","This mouza has no map table code"],api_load:["API থেকে লোড করুন","Load from API"],api_saved:["সংরক্ষিত API এলাকা","Saved API areas"],api_fb:["API মোডে এখনো কোনো এলাকা লোড হয়নি — ডেমো ডেটা দেখানো হচ্ছে।","No API area loaded yet — showing demo data."],a_api_h:["সরকারি API থেকে এলাকা যোগ করুন","Add area from government API"],a_reload:["রিফ্রেশ","Refresh"],a_deleted:["মুছে ফেলা হয়েছে","Removed"],a_confirm:["এই সংরক্ষিত এলাকা মুছবেন?","Remove this saved area?"],th_src:["উৎস","Source"],src_api:["API","API"],src_demo:["ডেমো","Demo"]
+ld_title:["সরকারি API থেকে এলাকা লোড হচ্ছে","Loading area from government API"],ld_dist:["জেলার সীমানা","District boundary"],ld_thana:["থানার সীমানা","Thana boundary"],ld_plots:["দাগের ডেটা","Plot data"],ld_land:["ভূমি ব্যবহারের ডেটা","Land-use data"],ld_save:["সংরক্ষণ ও সূচক তৈরি","Saving & indexing"],ld_cached:["সংরক্ষিত এলাকা থেকে লোড হয়েছে","Loaded from saved area"],ld_nocode:["এই মৌজার ম্যাপ কোড নেই","This mouza has no map table code"],api_load:["API থেকে লোড করুন","Load from API"],api_saved:["সংরক্ষিত API এলাকা","Saved API areas"],api_fb:["API মোডে এখনো কোনো এলাকা লোড হয়নি — ডেমো ডেটা দেখানো হচ্ছে।","No API area loaded yet — showing demo data."],a_api_h:["সরকারি API থেকে এলাকা যোগ করুন","Add area from government API"],a_reload:["রিফ্রেশ","Refresh"],a_deleted:["মুছে ফেলা হয়েছে","Removed"],a_confirm:["এই সংরক্ষিত এলাকা মুছবেন?","Remove this saved area?"],th_src:["উৎস","Source"],src_api:["API","API"],src_demo:["ডেমো","Demo"],a_new_fraud:["নতুন জালিয়াতি সতর্কতা","New fraud alert"],a_new_case:["নতুন নামজারি কেস","New mutation case"],a_add_alert:["সতর্কতা যোগ","Add alert"],a_add_case:["কেস যোগ","Add case"],a_ds:["ডেটাসেট / মৌজা","Dataset / mouza"],a_ftype:["জালিয়াতির ধরন","Fraud type"],a_sev:["তীব্রতা","Severity"],a_sev_auto:["স্বয়ংক্রিয়","Automatic"],a_conf:["আস্থা (%)","Confidence (%)"],a_note_l:["মন্তব্য (ঐচ্ছিক)","Note (optional)"],a_buyer:["ক্রেতা / আবেদনকারী","Buyer / applicant"],a_seller:["বিক্রেতা","Seller"],a_deed_no:["দলিল নং (ঐচ্ছিক)","Deed no. (optional)"],a_deed_date:["দলিলের তারিখ","Deed date"],a_create:["তৈরি করুন","Create"],a_cancel:["বাতিল","Cancel"],a_created:["সফলভাবে যোগ হয়েছে","Added successfully"],a_delete:["মুছুন","Delete"],a_custom:["ম্যানুয়াল","Manual"],a_confirm_del:["এটি মুছে ফেলবেন?","Delete this?"],a_key:["অ্যাডমিন কী দিন","Enter the admin key"],a_need_plot:["ডেটাসেট ও দাগ নম্বর দিন","Choose a dataset and plot no."],a_plot_hint:["এই ডেটাসেটের দাগ থেকে বেছে নিন","Pick from this dataset's plots"],a_mode_scope:["এটি শুধু বর্তমান ডেটা মোডে যোগ হবে","This is added to the current data mode only"],a_noplots:["এই মোডে কোনো ডেটাসেট নেই","No dataset in this mode"]
 };
 const t=k=>(T[k]||[k,k])[lang==='bn'?0:1];
 const D=v=>String(v??'').replace(/\d/g,d=>lang==='bn'?BN[d]:d);
@@ -1335,7 +1590,10 @@ const cls=c=>T['c_'+key(c)]?t('c_'+key(c)):(c||'—');
 const sub=c=>T['s_'+key(c)]?t('s_'+key(c)):(c||'—');
 const toast=m=>{const e=$('#toast');e.textContent=m;e.style.display='block';clearTimeout(toast.h);toast.h=setTimeout(()=>e.style.display='none',2800)};
 /* every request carries the active data mode -> server keeps the two modes isolated */
-const api=async(u,o={})=>{o={...o,headers:{...(o.headers||{}),'X-Data-Mode':dataMode}};const r=await fetch(u,o);let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw Object.assign(new Error(j.error||r.status),{status:r.status});return j};
+const api=async(u,o={})=>{const h={...(o.headers||{}),'X-Data-Mode':dataMode};try{const k=sessionStorage.getItem('adminKey');if(k)h['X-Admin-Key']=k}catch(e){}
+  const r=await fetch(u,{...o,headers:h});let j={};try{j=await r.json()}catch(e){}
+  if(r.status===401&&u.startsWith('/api/admin')&&!o._retry){const k=prompt(t('a_key'));if(k){try{sessionStorage.setItem('adminKey',k)}catch(e){}return api(u,{...o,_retry:1})}}
+  if(!r.ok)throw Object.assign(new Error(j.error||r.status),{status:r.status});return j};
 const PALETTE={'Commercial Area':'#e63946','Settlement':'#f4a261','Agriculture':'#8ab17d','Water Body':'#38bdf8','Road':'#9ca3af','Industrial Area':'#8b5cf6','Forest':'#15803d','Vacant Land':'#d6c28a'};
 const colorOf=c=>PALETTE[c]||`hsl(${[...(c||'?')].reduce((a,ch)=>a*31+ch.charCodeAt(0)>>>0,7)%360} 65% 50%)`;
 const STAGES=['registration','auto_check','union_office','ac_land','approved','khatian'];
@@ -1409,7 +1667,7 @@ async function loadApiArea(p,force){
   }catch(e){$('#ldTitle').textContent=t('err')+': '+e.message;$('#ldClose').hidden=false;return null}}
 
 /* ---------- mode switch: fully isolated state ---------- */
-function applyModeUI(){$$('#modeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.mode===dataMode));$('#datasetSearch').hidden=dataMode==='api';$('#apiSearch').hidden=dataMode!=='api';if(dataMode==='api')bindApi('h_')}
+function applyModeUI(){$$('.modeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.mode===dataMode));$('#datasetSearch').hidden=dataMode==='api';$('#apiSearch').hidden=dataMode!=='api';if(dataMode==='api')bindApi('h_')}
 async function switchMode(m){dataMode=m;localStorage.dataMode=m;applyModeUI();
   try{await refreshData()}catch(e){toast(e.message)}
   loaded=[];DATA=null;curSel=null;VR=null;TC=null;FA=[];WC=[];hiddenCls.clear();
@@ -1418,13 +1676,13 @@ async function switchMode(m){dataMode=m;localStorage.dataMode=m;applyModeUI();
   const h=location.hash.split('?')[0];if(location.hash&&h!==location.hash)location.hash=h;else route(false)}
 
 /* ---------- static i18n ---------- */
-function applyStatic(){document.documentElement.lang=lang;document.title=t('brand')+' — '+t('tagline');
+function applyStatic(){document.documentElement.lang=lang;$$('[data-ic]').forEach(e=>e.innerHTML=ico(e.dataset.ic,+e.dataset.s||18));document.title=t('brand')+' — '+t('tagline');
   $$('[data-i18n]').forEach(e=>e.textContent=t(e.dataset.i18n));$$('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
   $$('#langSeg button').forEach(b=>b.classList.toggle('on',b.dataset.lang===lang));$$('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.role===role));
   applyModeUI();$$('select').forEach(e=>{if(e._items&&e._ph){const v=e.value;fillApiSelect(e,e._items,e._ph);e.value=v}});
   $('#navAdmin').style.display=role==='admin'?'':'none'}
 $('#langSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;lang=b.dataset.lang;localStorage.lang=lang;applyStatic();route(true)};
-$('#modeSeg').onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.mode!==dataMode)switchMode(b.dataset.mode)};
+$$('.modeSeg').forEach(sg=>sg.onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.mode!==dataMode)switchMode(b.dataset.mode)});
 $('#roleSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;role=b.dataset.role;localStorage.role=role;applyStatic();
   if(role==='admin'&&cur.path.indexOf('/admin')!==0)location.hash='#/admin';else if(role==='user'&&cur.path.indexOf('/admin')===0)location.hash='#/';else route(true)};
 $('#themeBtn').onclick=()=>{const n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.theme=n};
@@ -1552,7 +1810,7 @@ function sidebar(){
   $$('#legend input').forEach(i=>i.onchange=()=>{i.checked?hiddenCls.delete(i.dataset.c):hiddenCls.add(i.dataset.c);renderData()});
   renderList();renderSaved()}
 function renderSaved(){if(dataMode!=='api')return;const a=DSL.filter(d=>d.source==='api');$('#m_fb').hidden=!DSL.some(d=>d.fallback);
-  $('#m_saved').innerHTML=a.map(d=>`<div class="rw" data-id="${esc(d.id)}">📍 ${esc(dn(d))} · ${esc(shl(d))}<span class="n">${nf(d.plots,0)}</span></div>`).join('')||`<small>${t('m_none')}</small>`;
+  $('#m_saved').innerHTML=a.map(d=>`<div class="rw" data-id="${esc(d.id)}">${ico('pin',15)} ${esc(dn(d))} · ${esc(shl(d))}<span class="n">${nf(d.plots,0)}</span></div>`).join('')||`<small>${t('m_none')}</small>`;
   $$('#m_saved .rw').forEach(e=>e.onclick=()=>loadIds([...new Set([...loaded,e.dataset.id])]).then(()=>{const d=DSL.find(x=>x.id===e.dataset.id);d&&d.bbox&&map.fitBounds(bbOf(d),{padding:[40,40]})}))}
 async function renderList(){
   const q=$('#q').value.trim(),el=$('#plist');let rows=[];
@@ -1564,16 +1822,17 @@ async function showDrawer(ds,no){
   const dr=$('#drawer');dr.hidden=false;dr.innerHTML=`<div class="dload">${t('loading')}</div>`;
   try{const r=await api(`/api/verify/${encodeURIComponent(ds)}/${encodeURIComponent(no)}`);if(!curSel||curSel[0]!==ds||curSel[1]!==no)return;
     const vt={safe:'v_verdict_safe',caution:'v_verdict_caution',danger:'v_verdict_danger'}[r.verdict];
-    dr.innerHTML=`<button class="icon x" id="dx" style="width:32px;height:32px">✕</button><h3>${t('v_plot')} ${X(r.label)}</h3>
+    dr.innerHTML=`<button class="icon x" id="dx" style="width:32px;height:32px">${ico('x',15)}</button><h3>${t('v_plot')} ${X(r.label)}</h3>
     <p style="margin:2px 0 10px;color:var(--mu);font-size:14px">${esc(nm(r.district))} · ${X(r.mouza)}${r.source==='api'?'':' · '+t('f_sheet')+' '+X(r.sheet)}</p>
     <span class="badge ${r.verdict}">${t(vt)} · ${nf(r.score,0)}</span> <span class="badge ${r.source==='api'?'ok':''}">${t('src_'+r.source)}</span>
     <dl class="kv" style="margin:12px 0"><dt>${t('d_owner')}</dt><dd>${esc(nm(r.owner))}</dd>
     <dt>${t('v_area')}</dt><dd>${nf(dec(r.area_sqm))} ${t('u_dec')}<br><small style="color:var(--mu)">${nf(r.area_sqm,0)} ${t('u_sqm')} · ${nf(r.area_sqm/4046.86,4)} ${t('u_acre')}</small></dd>
     <dt>${t('d_addr')}</dt><dd id="addr">…</dd></dl>
     <div class="chips" style="margin-bottom:12px">${r.parts.map(p=>`<span class="tag" style="background:${colorOf(p.maj)}">${esc(cls(p.maj))} · ${esc(sub(p.sub))} · ${nf(dec(p.area_sqm),1)}</span>`).join('')}</div>
-    <div class="btnrow"><a class="btn sm" href="#/verify?ds=${encodeURIComponent(ds)}&plot=${encodeURIComponent(no)}">🔎 ${t('d_report')}</a>
-    <button class="btn sm alt" id="dshare">🔗 ${t('d_share')}</button>
-    <a class="btn sm alt" target="_blank" rel="noopener" href="https://www.google.com/maps?q=${r.center[0]},${r.center[1]}">🌐 ${t('d_gmaps')}</a></div>`;
+    <div class="btnrow"><a class="btn sm" href="#/verify?ds=${encodeURIComponent(ds)}&plot=${encodeURIComponent(no)}">${ico('search',15)} ${t('d_report')}</a>
+    <button class="btn sm alt" id="dshare">${ico('link',15)} ${t('d_share')}</button>
+    <a class="btn sm alt" target="_blank" rel="noopener" href="https://www.google.com/maps?q=${r.center[0]},${r.center[1]}">${ico('globe',15)} ${t('d_gmaps')}</a></div>${role==='admin'?`<div class="btnrow" style="margin-top:8px"><button class="btn sm danger" id="dna">${ico('alert',15)} ${t('a_add_alert')}</button><button class="btn sm alt" id="dnc">${ico('clipboard',15)} ${t('a_add_case')}</button></div>`:''}`;
+    if(role==='admin'){$('#dna').onclick=()=>openCreate('fraud',{ds,plot:no});$('#dnc').onclick=()=>openCreate('case',{ds,plot:no})}
     $('#dx').onclick=()=>{dr.hidden=true;curSel=null;if(selLayer){selLayer.setStyle({color:'#ffd60a',weight:2});selLayer=null}mapUrl()};
     $('#dshare').onclick=()=>{navigator.clipboard?.writeText(location.href).then(()=>toast(t('d_copied')),()=>prompt('',location.href))};
     fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=17&accept-language=${lang==='bn'?'bn,en':'en'}&lat=${r.center[0]}&lon=${r.center[1]}`).then(x=>x.json()).then(j=>{const a=$('#addr');if(a)a.textContent=j.display_name||'—'}).catch(()=>{const a=$('#addr');if(a)a.textContent='—'})
@@ -1581,7 +1840,7 @@ async function showDrawer(ds,no){
 async function geocode(q){
   $('#place').value=q;const el=$('#placeRes');el.innerHTML=`<small>${t('loading')}</small>`;
   try{const r=await (await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=bd&limit=6&accept-language=${lang==='bn'?'bn,en':'en'}&q=${encodeURIComponent(q)}`)).json();
-    el.innerHTML=r.map((x,i)=>`<div class="rw" data-i="${i}">📍 <span>${esc(x.display_name.split(',').slice(0,3).join(','))}</span></div>`).join('')||`<small>${t('m_nodata')}</small>`;
+    el.innerHTML=r.map((x,i)=>`<div class="rw" data-i="${i}">${ico('pin',15)} <span>${esc(x.display_name.split(',').slice(0,3).join(','))}</span></div>`).join('')||`<small>${t('m_nodata')}</small>`;
     const go=x=>{const lat=+x.lat,lng=+x.lon;if(pinMark)map.removeLayer(pinMark);pinMark=L.marker([lat,lng]).addTo(map).bindPopup(esc(x.display_name)).openPopup();
       const near=DSL.filter(d=>d.center).map(d=>({d,m:map.distance([lat,lng],d.center)})).sort((a,b)=>a.m-b.m)[0];
       if(near&&near.m<4000){toast(t('m_place_hit'));loadIds([...new Set([...loaded,near.d.id])],{fit:false}).then(()=>map.fitBounds(bbOf(near.d),{padding:[40,40]}))}
@@ -1614,12 +1873,12 @@ $('#v_go').onclick=()=>{const s=$('#v_sheet').value,p=$('#v_plot').value.trim();
 async function runVerify(ds,p){$('#v_out').innerHTML=`<div class="empty">${t('loading')}</div>`;
   try{VR=await api(`/api/verify/${encodeURIComponent(ds)}/${encodeURIComponent(p)}`);drawReport()}catch(e){VR=null;$('#v_out').innerHTML=`<div class="card empty">${t('v_notfound')}</div>`}}
 function drawReport(){const r=VR;if(!r)return;
-  const vt={safe:'v_verdict_safe',caution:'v_verdict_caution',danger:'v_verdict_danger'}[r.verdict],ic={pass:'✓',warn:'!',fail:'✕',queued:'…'};
+  const vt={safe:'v_verdict_safe',caution:'v_verdict_caution',danger:'v_verdict_danger'}[r.verdict],ic={pass:ico('check',14),warn:ico('alert',14),fail:ico('x',14),queued:ico('clock',14)};
   const hist=r.history.map(h=>`<li><b>${t('h_'+h.type)}</b> — ${esc(nm(h.from))} → ${esc(nm(h.to))}<small>${fd(h.date)} · ${t('v_deed')} ${X(h.deed_no)} · ${t('v_case')} ${X(h.case_no)}</small></li>`).join('');
   $('#v_out').innerHTML=`
   <div class="vbanner ${r.verdict}"><div class="gauge" style="--p:${r.score}"><b>${nf(r.score,0)}</b><small>${t('v_score')}</small></div>
     <div><h2>${t(vt)}</h2><p>${t('v_plot')} ${X(r.label)} · ${esc(nm(r.district))} · ${X(r.mouza)}${r.source==='api'?'':' · '+t('f_sheet')+' '+X(r.sheet)}</p>
-    <div class="btnrow"><button class="btn sm alt" onclick="print()">🖨 ${t('v_print')}</button><a class="btn sm alt" href="#/map?ds=${encodeURIComponent(r.ds)}&plot=${encodeURIComponent(r.plot_no)}">🗺 ${t('open_map')}</a></div></div></div>
+    <div class="btnrow"><button class="btn sm alt" onclick="print()">${ico('printer',15)} ${t('v_print')}</button><a class="btn sm alt" href="#/map?ds=${encodeURIComponent(r.ds)}&plot=${encodeURIComponent(r.plot_no)}">${ico('map',15)} ${t('open_map')}</a></div></div></div>
   <div class="vgrid">
    <div class="card"><h3>${t('v_status')}</h3>${r.checks.map(c=>`<div class="ck ${c.level}"><i>${ic[c.level]}</i><span>${t('ck_'+c.key)}</span><em>${t('lv_'+c.level)}</em></div>`).join('')}</div>
    <div class="card"><h3>${t('v_owner_h')}</h3><dl class="kv">
@@ -1627,9 +1886,9 @@ function drawReport(){const r=VR;if(!r)return;
      <dt>${t('v_khatian')}</dt><dd>${X(r.khatian)}</dd><dt>${t('v_dag')}</dt><dd>${X(r.dag)}</dd><dt>${t('v_mouza')}</dt><dd>${X(r.mouza)} (${X(r.m_code)})</dd><dt>${t('v_share')}</dt><dd>${X(r.share)}</dd>
      <dt>${t('v_area')}</dt><dd>${nf(dec(r.area_sqm))} ${t('u_dec')} · ${nf(r.area_sqm/4046.86,4)} ${t('u_acre')}</dd></dl></div>
    <div class="card"><h3>${t('v_location')}</h3><div id="vmap"></div><div class="chips">${r.parts.map(p=>`<span class="tag" style="background:${colorOf(p.maj)}">${esc(cls(p.maj))} · ${esc(sub(p.sub))} · ${nf(dec(p.area_sqm),1)} ${t('u_dec')}</span>`).join('')}</div></div>
-   <div class="card"><h3>${t('v_flags')}</h3>${r.flags.length?r.flags.map(f=>`<div class="item"><span class="badge ${f.severity}">${t('sev_'+f.severity)}</span> <b>${t('ft_'+f.type)}</b><ul class="adv" style="margin-top:6px">${f.evidence.map(e=>`<li>${X(nm(e))}</li>`).join('')}</ul></div>`).join(''):`<div class="empty">✓ ${t('v_noflags')}</div>`}</div>
+   <div class="card"><h3>${t('v_flags')}</h3>${r.flags.length?r.flags.map(f=>`<div class="item"><span class="badge ${f.severity}">${t('sev_'+f.severity)}</span> <b>${t('ft_'+f.type)}</b><ul class="adv" style="margin-top:6px">${f.evidence.map(e=>`<li>${X(nm(e))}</li>`).join('')}</ul></div>`).join(''):`<div class="empty">${ico('check',15)} ${t('v_noflags')}</div>`}</div>
    <div class="card wide"><h3>${t('v_pending')}</h3>
-     ${r.pending.length?r.pending.map(p=>`<div class="item"><span class="badge warn">${t('p_'+p.type)}</span> ${X(p.ref)} · ${t('fo_'+p.forum)} · ${t('v_since')} ${fd(p.since)}</div>`).join(''):`<div class="item">✓ ${t('v_nopending')}</div>`}
+     ${r.pending.length?r.pending.map(p=>`<div class="item"><span class="badge warn">${t('p_'+p.type)}</span> ${X(p.ref)} · ${t('fo_'+p.forum)} · ${t('v_since')} ${fd(p.since)}</div>`).join(''):`<div class="item">${ico('check',15)} ${t('v_nopending')}</div>`}
      <div class="item"><span class="badge ${r.khas==='none'?'pass':'fail'}">${t('kh_'+r.khas)}</span> <span class="badge ${r.acq==='none'?'pass':r.acq==='proposed'?'warn':'fail'}">${t('aq_'+r.acq)}</span></div></div>
    <div class="card wide"><h3>${t('v_hist')}</h3><ul class="tl">${hist}</ul></div>
    <div class="card wide"><h3>${t('v_advice')}</h3><ul class="adv">${r.advice.map(a=>`<li>${X(nm(a))}</li>`).join('')}</ul></div>
@@ -1646,7 +1905,7 @@ function renderTrack(keep){
 $('#tr_go').onclick=()=>{const v=$('#tr_in').value.trim();if(v)runTrack(v)};$('#tr_in').onkeydown=e=>{if(e.key==='Enter')$('#tr_go').click()};
 async function runTrack(id){try{TC=await api('/api/track/'+encodeURIComponent(id));drawTrack()}catch(e){TC=null;$('#tr_out').innerHTML=`<div class="card empty">${t('tr_notfound')}</div>`}}
 function caseBody(c){
-  const ic={pass:'✓',warn:'!',fail:'✕',queued:'…'};
+  const ic={pass:ico('check',14),warn:ico('alert',14),fail:ico('x',14),queued:ico('clock',14)};
   const steps=STAGES.map((s,i)=>`<div class="${i<c.stage||c.status==='completed'?'done':i===c.stage?'cur '+(c.status==='flagged'||c.status==='rejected'?'flagged':''):''}">${t('sg_'+s)}</div>`).join('');
   const dl=c.days_left,sla=c.status==='completed'?'':` · <b style="color:${dl<0?'var(--bd)':'var(--g)'}">${nf(Math.abs(dl),0)} ${dl<0?t('tr_over'):t('tr_left')}</b>`;
   return `<div class="stepper">${steps}</div>
@@ -1656,13 +1915,13 @@ function caseBody(c){
 function drawTrack(){const c=TC;if(!c)return;
   $('#tr_out').innerHTML=`<div class="card"><div class="dhead"><div><h2 style="font-size:22px">${c.id}</h2><p style="margin:2px 0 0;color:var(--mu)">${t('tr_plot')} ${X(c.label)} · ${esc(nm(c.district))} · ${t('f_sheet')} ${X(c.sheet)}</p></div><span class="badge ${c.status}">${t('cs_'+c.status)}</span></div>
   <dl class="kv" style="margin-bottom:16px"><dt>${t('tr_buyer')}</dt><dd>${esc(nm(c.buyer))}</dd><dt>${t('tr_seller')}</dt><dd>${esc(nm(c.seller))}</dd><dt>${t('tr_deed')}</dt><dd>${X(c.deed_no)} · ${fd(c.deed_date)}</dd><dt>${t('tr_office')}</dt><dd>${esc(nm(c.office))}</dd></dl>
-  ${caseBody(c)}<div class="btnrow" style="margin-top:14px"><a class="btn sm alt" href="#/verify?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}">🔎 ${t('d_report')}</a><a class="btn sm alt" href="#/map?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}">🗺 ${t('open_map')}</a></div></div>`}
+  ${caseBody(c)}<div class="btnrow" style="margin-top:14px"><a class="btn sm alt" href="#/verify?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}">${ico('search',15)} ${t('d_report')}</a><a class="btn sm alt" href="#/map?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}">${ico('map',15)} ${t('open_map')}</a></div></div>`}
 
 /* ---------- admin ---------- */
 let atab='overview',FA=[],fType='',fStat='',WC=[];
 function renderAdmin(){
   const root=$('#a_root');
-  if(role!=='admin'){root.innerHTML=`<div class="phead"><div class="card empty" style="padding:40px"><h2>🔒 ${t('a_gate_t')}</h2><p>${t('a_gate_d')}</p><button class="btn" id="a_en">${t('a_enable')}</button></div></div>`;
+  if(role!=='admin'){root.innerHTML=`<div class="phead"><div class="card empty" style="padding:40px"><h2>${ico('lock',22)} ${t('a_gate_t')}</h2><p>${t('a_gate_d')}</p><button class="btn" id="a_en">${t('a_enable')}</button></div></div>`;
     $('#a_en').onclick=()=>{role='admin';localStorage.role=role;applyStatic();renderAdmin()};return}
   root.innerHTML=`<div class="phead"><h1>${t('a_title')} <span class="badge ${dataMode==='api'?'ok':''}" style="vertical-align:middle">${dataMode==='api'?t('mode_api'):t('mode_dataset')}</span></h1><p><span class="note">${t('a_note')}</span></p></div>
   <div class="tabs">${[['overview','a_overview'],['fraud','a_fraud'],['workflow','a_workflow'],['data','a_data']].map(([k,l])=>`<button data-tab="${k}" class="${k===atab?'on':''}">${t(l)}</button>`).join('')}</div><div id="a_body"><div class="empty">${t('loading')}</div></div>`;
@@ -1674,40 +1933,85 @@ async function aOverview(){const o=await api('/api/admin/overview');
   <div class="two"><div class="card"><h3>${t('a_bytype')}</h3>${bars(FT.map(f=>[t('ft_'+f),o.by_type[f]||0]))}</div>
   <div class="card"><h3>${t('a_funnel')}</h3>${bars(STAGES.map((s,i)=>[t('sg_'+s),o.by_stage[i]]))}</div></div>
   <div class="card" style="margin-top:16px"><h3>${t('a_recent')}</h3>${o.recent.map(a=>`<div class="item"><span class="badge ${a.severity}">${t('sev_'+a.severity)}</span> <b>${t('ft_'+a.type)}</b> · ${a.id} · ${t('v_plot')} ${X(a.label)} · ${esc(nm(a.district))} <span class="badge ${a.status}" style="float:right">${t('st_'+a.status)}</span></div>`).join('')||`<div class="empty">${t('m_none')}</div>`}</div>`}
+const STS=['new','investigating','resolved','false_positive'];
 async function aFraud(){FA=(await api('/api/admin/fraud')).alerts;drawFraud()}
 function drawFraud(){
   const rows=FA.filter(a=>(!fType||a.type===fType)&&(!fStat||a.status===fStat));
-  $('#a_body').innerHTML=`<div class="filters"><button class="fchip ${fType?'':'on'}" data-t="">${t('a_all')}</button>${FT.map(f=>`<button class="fchip ${fType===f?'on':''}" data-t="${f}">${t('ft_'+f)}</button>`).join('')}
-  <select id="fs"><option value="">${t('th_status')}: ${t('a_all')}</option>${['new','investigating','resolved','false_positive'].map(s=>`<option value="${s}" ${fStat===s?'selected':''}>${t('st_'+s)}</option>`).join('')}</select></div>
-  <div class="card tbl" style="padding:6px"><table><thead><tr><th>${t('th_id')}</th><th>${t('th_type')}</th><th>${t('th_sev')}</th><th>${t('th_plot')}</th><th>${t('th_conf')}</th><th>${t('th_date')}</th><th>${t('th_status')}</th></tr></thead><tbody>
-  ${rows.map(a=>`<tr class="r" data-id="${a.id}"><td>${a.id}</td><td><b>${t('ft_'+a.type)}</b></td><td><span class="badge ${a.severity}">${t('sev_'+a.severity)}</span></td><td>${X(a.label)} · ${esc(nm(a.district))} ${X(a.sheet)}</td><td>${nf(a.confidence,0)}%</td><td>${fd(a.detected)}</td>
-  <td><select data-s="${a.id}">${['new','investigating','resolved','false_positive'].map(s=>`<option value="${s}" ${a.status===s?'selected':''}>${t('st_'+s)}</option>`).join('')}</select></td></tr>
-  <tr class="det" hidden><td colspan="7"><b>${t('a_evidence')}</b><ul class="adv">${a.evidence.map(e=>`<li>${X(nm(e))}</li>`).join('')}</ul><div class="btnrow"><a class="btn sm alt" href="#/map?ds=${a.ds}&plot=${encodeURIComponent(a.plot_no)}">🗺 ${t('open_map')}</a><a class="btn sm alt" href="#/verify?ds=${a.ds}&plot=${encodeURIComponent(a.plot_no)}">🔎 ${t('d_report')}</a></div></td></tr>`).join('')}</tbody></table></div>`;
+  const body=rows.map(a=>`<tr class="r" data-id="${a.id}">
+    <td data-l="${t('th_id')}">${a.id}${a.custom?` <span class="badge">${t('a_custom')}</span>`:''}</td>
+    <td data-l="${t('th_type')}"><b>${t('ft_'+a.type)}</b></td>
+    <td data-l="${t('th_sev')}"><span class="badge ${a.severity}">${t('sev_'+a.severity)}</span></td>
+    <td data-l="${t('th_plot')}">${X(a.label)} · ${esc(nm(a.district))} ${X(a.sheet)}</td>
+    <td data-l="${t('th_conf')}">${nf(a.confidence,0)}%</td>
+    <td data-l="${t('th_date')}">${fd(a.detected)}</td>
+    <td data-l="${t('th_status')}"><select data-s="${a.id}">${STS.map(s=>`<option value="${s}" ${a.status===s?'selected':''}>${t('st_'+s)}</option>`).join('')}</select></td></tr>
+  <tr class="det" hidden><td colspan="7"><b>${t('a_evidence')}</b><ul class="adv">${a.evidence.map(e=>`<li>${X(nm(e))}</li>`).join('')}</ul>
+    <div class="btnrow"><a class="btn sm alt" href="#/map?ds=${a.ds}&plot=${encodeURIComponent(a.plot_no)}">${ico('map',15)} ${t('open_map')}</a><a class="btn sm alt" href="#/verify?ds=${a.ds}&plot=${encodeURIComponent(a.plot_no)}">${ico('search',15)} ${t('d_report')}</a>${a.custom?`<button class="btn sm danger" data-delf="${a.id}">${ico('trash',15)} ${t('a_delete')}</button>`:''}</div></td></tr>`).join('');
+  $('#a_body').innerHTML=`<div class="toolbar"><div class="filters"><button class="fchip ${fType?'':'on'}" data-t="">${t('a_all')}</button>${FT.map(f=>`<button class="fchip ${fType===f?'on':''}" data-t="${f}">${t('ft_'+f)}</button>`).join('')}
+  <select id="fs"><option value="">${t('th_status')}: ${t('a_all')}</option>${STS.map(s=>`<option value="${s}" ${fStat===s?'selected':''}>${t('st_'+s)}</option>`).join('')}</select></div>
+  <button class="btn" id="a_newf">${ico('plus',16)} ${t('a_new_fraud')}</button></div>
+  <div class="card tbl" style="padding:6px"><table class="rt"><thead><tr><th>${t('th_id')}</th><th>${t('th_type')}</th><th>${t('th_sev')}</th><th>${t('th_plot')}</th><th>${t('th_conf')}</th><th>${t('th_date')}</th><th>${t('th_status')}</th></tr></thead><tbody>${body||`<tr><td colspan="7" class="empty">${t('m_none')}</td></tr>`}</tbody></table></div>`;
+  $('#a_newf').onclick=()=>openCreate('fraud');
   $$('.filters .fchip').forEach(b=>b.onclick=()=>{fType=b.dataset.t;drawFraud()});$('#fs').onchange=e=>{fStat=e.target.value;drawFraud()};
   $$('tr.r').forEach(r=>r.onclick=e=>{if(e.target.closest('select'))return;r.nextElementSibling.hidden=!r.nextElementSibling.hidden});
-  $$('td select').forEach(s=>s.onchange=async()=>{try{const j=await api('/api/admin/fraud/'+s.dataset.s,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:s.value})});FA=FA.map(a=>a.id===j.alert.id?j.alert:a);toast(t('a_updated'))}catch(e){toast(e.message)}})}
+  $$('td select').forEach(sl=>sl.onchange=async()=>{try{const j=await api('/api/admin/fraud/'+sl.dataset.s,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:sl.value})});FA=FA.map(a=>a.id===j.alert.id?j.alert:a);toast(t('a_updated'))}catch(e){toast(e.message)}});
+  $$('[data-delf]').forEach(b=>b.onclick=async()=>{if(!confirm(t('a_confirm_del')))return;
+    try{await api('/api/admin/fraud/'+b.dataset.delf,{method:'DELETE'});FA=FA.filter(a=>a.id!==b.dataset.delf);STATS=await api('/api/stats');toast(t('a_deleted'));drawFraud()}catch(e){toast(e.message)}})}
 async function aWorkflow(){WC=(await api('/api/admin/workflow')).cases;drawBoard()}
 function drawBoard(){
-  $('#a_body').innerHTML=`<div class="board">${STAGES.map((s,i)=>{const cs=WC.filter(c=>c.stage===i);return `<div class="col"><h4><span>${t('sg_'+s)}</span><span>${nf(cs.length,0)}</span></h4>${cs.map(c=>`<div class="kcard ${c.status}" data-id="${c.id}"><b>${c.id}</b>${t('v_plot')} ${X(c.label)} · ${esc(nm(c.district))}<br><small>${esc(nm(c.buyer))}</small><div class="dots">${c.checks.map(k=>`<i class="${k.level}"></i>`).join('')}</div><div style="margin-top:6px"><span class="badge ${c.status}">${t('cs_'+c.status)}</span></div></div>`).join('')}</div>`}).join('')}</div>`;
+  $('#a_body').innerHTML=`<div class="toolbar" style="justify-content:flex-end"><button class="btn" id="a_newc">${ico('plus',16)} ${t('a_new_case')}</button></div>
+  <div class="board">${STAGES.map((s,i)=>{const cs=WC.filter(c=>c.stage===i);return `<div class="col"><h4><span>${t('sg_'+s)}</span><span>${nf(cs.length,0)}</span></h4>${cs.map(c=>`<div class="kcard ${c.status}" data-id="${c.id}"><b>${c.id}${c.custom?` <span class="badge">${t('a_custom')}</span>`:''}</b>${t('v_plot')} ${X(c.label)} · ${esc(nm(c.district))}<br><small>${esc(nm(c.buyer))}</small><div class="dots">${c.checks.map(k=>`<i class="${k.level}"></i>`).join('')}</div><div style="margin-top:6px"><span class="badge ${c.status}">${t('cs_'+c.status)}</span></div></div>`).join('')}</div>`}).join('')}</div>`;
+  $('#a_newc').onclick=()=>openCreate('case');
   $$('.kcard').forEach(k=>k.onclick=()=>openCase(k.dataset.id))}
 function openCase(id){const c=WC.find(x=>x.id===id);if(!c)return;const d=$('#dlg');
-  d.innerHTML=`<div class="dhead"><div><h2 style="font-size:20px">${c.id} <span class="badge ${c.status}">${t('cs_'+c.status)}</span></h2><p style="margin:2px 0 0;color:var(--mu)">${t('tr_plot')} ${X(c.label)} · ${esc(nm(c.district))} · ${esc(nm(c.buyer))} ← ${esc(nm(c.seller))}</p></div><button class="icon" id="dc">✕</button></div>
-  ${caseBody(c)}<div class="btnrow" style="margin-top:16px"><button class="btn sm" data-a="advance">▶ ${t('a_advance')}</button><button class="btn sm alt" data-a="hold">⏸ ${t('a_hold')}</button><button class="btn sm alt" data-a="release">✔ ${t('a_release')}</button><button class="btn sm danger" data-a="reject">✕ ${t('a_reject')}</button>
-  <a class="btn sm alt" href="#/verify?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}" onclick="$('#dlg').close()">🔎 ${t('d_report')}</a></div>`;
+  d.innerHTML=`<div class="dhead"><div><h2 style="font-size:20px">${c.id} <span class="badge ${c.status}">${t('cs_'+c.status)}</span>${c.custom?` <span class="badge">${t('a_custom')}</span>`:''}</h2><p style="margin:2px 0 0;color:var(--mu)">${t('tr_plot')} ${X(c.label)} · ${esc(nm(c.district))} · ${esc(nm(c.buyer))} ← ${esc(nm(c.seller))}</p></div><button class="icon" id="dc" aria-label="${t('close')}">${ico('x')}</button></div>
+  ${caseBody(c)}<div class="btnrow" style="margin-top:16px"><button class="btn sm" data-a="advance">${ico('play',14)} ${t('a_advance')}</button><button class="btn sm alt" data-a="hold">${ico('pause',14)} ${t('a_hold')}</button><button class="btn sm alt" data-a="release">${ico('okc',15)} ${t('a_release')}</button><button class="btn sm danger" data-a="reject">${ico('ban',15)} ${t('a_reject')}</button>
+  <a class="btn sm alt" href="#/verify?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}" onclick="$('#dlg').close()">${ico('search',15)} ${t('d_report')}</a>${c.custom?`<button class="btn sm danger" id="dcdel">${ico('trash',15)} ${t('a_delete')}</button>`:''}</div>`;
   $('#dc').onclick=()=>d.close();
+  if(c.custom)$('#dcdel').onclick=async()=>{if(!confirm(t('a_confirm_del')))return;
+    try{await api('/api/admin/workflow/'+c.id,{method:'DELETE'});WC=WC.filter(x=>x.id!==c.id);STATS=await api('/api/stats');d.close();toast(t('a_deleted'));drawBoard()}catch(e){toast(e.message)}};
   $$('#dlg [data-a]').forEach(b=>b.onclick=async()=>{try{const j=await api('/api/admin/workflow/'+c.id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.a})});
     WC=WC.map(x=>x.id===c.id?j.case:x);drawBoard();openCase(c.id)}catch(e){toast(e.message)}});
   if(!d.open)d.showModal()}
+/* add a fraud alert / mutation case for any plot of the ACTIVE data mode */
+function openCreate(kind,pre={}){
+  if(!DSL.length)return toast(t('a_noplots'));
+  const d=$('#dlg'),isF=kind==='fraud',ds0=pre.ds&&DSL.some(x=>x.id===pre.ds)?pre.ds:DSL[0].id,today=new Date().toISOString().slice(0,10);
+  const fields=isF?`<label class="f"><span>${t('a_ftype')}</span><select id="n_type">${FT.map(f=>`<option value="${f}">${t('ft_'+f)}</option>`).join('')}</select></label>
+    <label class="f"><span>${t('a_sev')}</span><select id="n_sev"><option value="">${t('a_sev_auto')}</option><option value="high">${t('sev_high')}</option><option value="medium">${t('sev_medium')}</option></select></label>
+    <label class="f"><span>${t('a_conf')}</span><input id="n_conf" type="number" min="1" max="99" value="85" inputmode="numeric"></label>
+    <label class="f full"><span>${t('a_note_l')}</span><textarea id="n_note" rows="3" maxlength="300"></textarea></label>`
+  :`<label class="f"><span>${t('a_buyer')}</span><input id="n_buyer" maxlength="80" autocomplete="off"></label>
+    <label class="f"><span>${t('a_seller')}</span><input id="n_seller" maxlength="80" autocomplete="off"></label>
+    <label class="f"><span>${t('a_deed_no')}</span><input id="n_deed" maxlength="30" autocomplete="off"></label>
+    <label class="f"><span>${t('a_deed_date')}</span><input id="n_date" type="date" value="${today}" max="${today}"></label>`;
+  d.innerHTML=`<div class="dhead"><div><h2 style="font-size:20px">${isF?t('a_new_fraud'):t('a_new_case')}</h2><p style="margin:2px 0 0;color:var(--mu);font-size:13.5px">${t('a_mode_scope')} · <b>${dataMode==='api'?t('mode_api'):t('mode_dataset')}</b></p></div><button class="icon" id="dc" aria-label="${t('close')}">${ico('x')}</button></div>
+  <div class="fgrid"><label class="f full"><span>${t('a_ds')}</span><select id="n_ds">${DSL.map(x=>`<option value="${esc(x.id)}" ${x.id===ds0?'selected':''}>${esc(dn(x))} · ${esc(shl(x))} (${nf(x.plots,0)})</option>`).join('')}</select></label>
+  <label class="f full"><span>${t('f_plot')}</span><input id="n_plot" list="n_plots" autocomplete="off" value="${esc(pre.plot||'')}" placeholder="${esc(t('a_plot_hint'))}"><datalist id="n_plots"></datalist></label>${fields}</div>
+  <div class="btnrow" style="margin-top:16px;justify-content:flex-end"><button class="btn alt" id="n_cancel">${t('a_cancel')}</button><button class="btn" id="n_go">${ico('plus',16)} ${t('a_create')}</button></div>`;
+  const fp=()=>fillPlots($('#n_plots'),$('#n_ds').value);fp();$('#n_ds').onchange=()=>{$('#n_plot').value='';fp()};
+  $('#dc').onclick=$('#n_cancel').onclick=()=>d.close();
+  $('#n_go').onclick=async()=>{const ds=$('#n_ds').value,plot_no=$('#n_plot').value.trim();if(!ds||!plot_no)return toast(t('a_need_plot'));
+    const body=isF?{ds,plot_no,type:$('#n_type').value,severity:$('#n_sev').value,confidence:+$('#n_conf').value||85,note:$('#n_note').value}
+      :{ds,plot_no,buyer:$('#n_buyer').value,seller:$('#n_seller').value,deed_no:$('#n_deed').value,deed_date:$('#n_date').value};
+    $('#n_go').disabled=true;
+    try{await api(isF?'/api/admin/fraud':'/api/admin/workflow',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      d.close();toast(t('a_created'));STATS=await api('/api/stats');
+      if(cur.path.startsWith('/admin')){atab=isF?'fraud':'workflow';renderAdmin()}}
+    catch(e){toast(e.message);$('#n_go').disabled=false}};
+  if(!d.open)d.showModal()}
 async function aData(){const L=await api('/api/datasets'),isApi=dataMode==='api';
   $('#a_body').innerHTML=`${L.some(d=>d.fallback)?`<p><span class="note">${t('api_fb')}</span></p>`:''}
-  <div class="card tbl" style="padding:6px"><table><thead><tr><th>${t('th_ds')}</th><th>${t('th_src')}</th><th>${t('f_district')}</th><th>${t('f_sheet')} / ${t('f_mouza')}</th><th>${t('th_plots')}</th><th>${t('th_parts')}</th><th>${t('th_area')}</th><th></th></tr></thead><tbody>
-  ${L.map(d=>`<tr><td><code>${esc(d.id)}</code></td><td><span class="badge ${d.source==='api'?'ok':''}">${t('src_'+d.source)}</span></td><td>${esc(dn(d))}</td><td>${d.source==='api'?esc(shl(d)):X(d.sheet)}</td><td>${nf(d.plots,0)}</td><td>${nf(d.parts,0)}</td><td>${nf(dec(d.area_sqm),1)}</td>
-  <td><div class="btnrow"><a class="btn sm alt" href="#/map?ds=${esc(d.id)}">🗺</a>${d.source==='api'?`<button class="btn sm danger" data-del="${esc(d.id)}">✕</button>`:''}</div></td></tr>`).join('')}</tbody></table></div>
-  ${isApi?`<div class="card" style="margin-top:16px"><h3>${t('a_api_h')}</h3>${apiBoxHTML('a_')}<div class="btnrow" style="margin-top:8px"><button class="btn alt" id="a_apire">${t('a_reload')}</button></div></div>`
+  <div class="card tbl" style="padding:6px"><table class="rt"><thead><tr><th>${t('th_ds')}</th><th>${t('th_src')}</th><th>${t('f_district')}</th><th>${t('f_sheet')} / ${t('f_mouza')}</th><th>${t('th_plots')}</th><th>${t('th_parts')}</th><th>${t('th_area')}</th><th></th></tr></thead><tbody>
+  ${L.map(d=>`<tr class="r"><td data-l="${t('th_ds')}"><code>${esc(d.id)}</code></td><td data-l="${t('th_src')}"><span class="badge ${d.source==='api'?'ok':''}">${t('src_'+d.source)}</span></td><td data-l="${t('f_district')}">${esc(dn(d))}</td><td data-l="${t('f_mouza')}">${d.source==='api'?esc(shl(d)):X(d.sheet)}</td><td data-l="${t('th_plots')}">${nf(d.plots,0)}</td><td data-l="${t('th_parts')}">${nf(d.parts,0)}</td><td data-l="${t('th_area')}">${nf(dec(d.area_sqm),1)}</td>
+  <td><div class="btnrow"><a class="btn sm alt" href="#/map?ds=${esc(d.id)}" aria-label="${t('open_map')}">${ico('map',15)}</a><button class="btn sm alt" data-af="${esc(d.id)}">${ico('alert',15)} ${t('a_add_alert')}</button><button class="btn sm alt" data-ac="${esc(d.id)}">${ico('clipboard',15)} ${t('a_add_case')}</button>${d.source==='api'?`<button class="btn sm danger" data-del="${esc(d.id)}" aria-label="${t('a_delete')}">${ico('trash',15)}</button>`:''}</div></td></tr>`).join('')}</tbody></table></div>
+  ${isApi?`<div class="card" style="margin-top:16px"><h3>${t('a_api_h')}</h3>${apiBoxHTML('a_')}<div class="btnrow" style="margin-top:8px"><button class="btn alt" id="a_apire">${ico('refresh',16)} ${t('a_reload')}</button></div></div>`
   :`<div class="card" style="margin-top:16px"><h3>${t('a_upload_h')}</h3><p style="color:var(--mu);font-size:14px;margin-top:0">${t('a_upload_help')}</p>
-  <div class="formrow" style="grid-template-columns:1fr 1fr 1fr auto"><label class="f"><span>${t('a_name')}</span><input id="u_name" placeholder="gazipur_002"></label>
+  <div class="formrow up"><label class="f"><span>${t('a_name')}</span><input id="u_name" placeholder="gazipur_002"></label>
   <label class="f"><span>${t('a_land_f')}</span><input type="file" id="u_land" accept=".json"></label><label class="f"><span>${t('a_plot_f')}</span><input type="file" id="u_plot" accept=".json"></label>
   <button class="btn" id="u_go">${t('a_upload_btn')}</button></div></div>`}`;
+  $$('[data-af]').forEach(b=>b.onclick=()=>openCreate('fraud',{ds:b.dataset.af}));
+  $$('[data-ac]').forEach(b=>b.onclick=()=>openCreate('case',{ds:b.dataset.ac}));
   $$('[data-del]').forEach(b=>b.onclick=async()=>{if(!confirm(t('a_confirm')))return;
     try{await api('/api/admin/dataset/'+b.dataset.del,{method:'DELETE'});await refreshData();toast(t('a_deleted'));aData()}catch(e){toast(e.message)}});
   if(isApi){bindApi('a_');const go=async f=>{const id=await loadApiArea('a_',f);if(id)aData()};$('#a_apiload').onclick=()=>go(false);$('#a_apire').onclick=()=>go(true)}
@@ -1729,7 +2033,9 @@ if __name__ == "__main__":
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--dev", action="store_true", help="disable the devtools deterrent while developing")
     a = ap.parse_args()
+    HARDEN["on"] = not a.dev
     write_demo()
     print(f"ভূমি দর্পণ  ->  http://{a.host}:{a.port}   (data folder: {DATA_DIR}, API areas: {API_DIR})")
     if not a.no_browser:
