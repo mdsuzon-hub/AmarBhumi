@@ -13,6 +13,9 @@ Data files (auto-discovered, hot-reloaded):
   Records: {"geom": "POLYGON((lon lat, ...))", "plot_no_en": "123", "label": "১২৩",
             "m_code": "3601", "maj_class": "Settlement", "sub_class": "Homestead", ...}
   If no data exists, 3 demo datasets are generated on first start.
+  Government map lookups are available through the server-side /api/bd/* proxy.
+  The proxy obtains a fresh CSRF token automatically; set BD_MAP_URL to override
+  the upstream service URL.
 
 Roles (MVP, no login):  User = public pages.  Admin = switch in the header -> #/admin
 Ownership, cases, fraud alerts and mutation workflow are DUMMY data (deterministic).
@@ -25,6 +28,9 @@ import os
 import random
 import re
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 import zlib
 from datetime import date, timedelta
@@ -38,6 +44,10 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 TODAY = date.today()
 STATE = {"fraud": {}, "wf": {}}  # in-memory admin actions (MVP)
+
+BD_MAP_URL = os.environ.get("BD_MAP_URL", "https://map.land.gov.bd")
+_bd_session = {"token": None, "cookies": None}
+_bd_lock = threading.Lock()
 
 BN_DIGITS = "০১২৩৪৫৬৭৮৯"
 BN_DIST = {
@@ -53,6 +63,41 @@ BN_DIST = {
 
 def bn_digits(s):
     return "".join(BN_DIGITS[int(c)] if c.isdigit() else c for c in str(s))
+
+
+def _bd_request(path, fields):
+    """POST to the government map service using a fresh Laravel CSRF session."""
+    with _bd_lock:
+        if not _bd_session["token"] or not _bd_session["cookies"]:
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+            page = opener.open(BD_MAP_URL + "/", timeout=15).read().decode("utf-8", "replace")
+            match = re.search(r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)', page, re.I)
+            if not match:
+                raise RuntimeError("Government map service did not provide a CSRF token")
+            _bd_session["token"] = match.group(1)
+            _bd_session["cookies"] = opener
+        opener = _bd_session["cookies"]
+        data = dict(fields)
+        data["_token"] = _bd_session["token"]
+        req = urllib.request.Request(
+            BD_MAP_URL + path,
+            data=urllib.parse.urlencode(data).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "X-CSRF-TOKEN": _bd_session["token"],
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            method="POST",
+        )
+        try:
+            with opener.open(req, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 419:
+                _bd_session.update(token=None, cookies=None)
+            raise RuntimeError(f"Government map service returned HTTP {exc.code}") from exc
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Government map service request failed: {exc}") from exc
 
 
 # ----------------------------------------------------------------- WKT -> GeoJSON
@@ -448,6 +493,84 @@ def api_datasets():
     return jsonify(summaries())
 
 
+@app.route("/api/bd/divisions")
+def api_bd_divisions():
+    try:
+        return jsonify(_bd_request("/getAdminByCode", {
+            "level": "forDiv",
+            "column": "division_n",
+        }))
+    except RuntimeError as exc:
+        return err(str(exc), 502)
+
+
+@app.route("/api/bd/districts")
+def api_bd_districts():
+    division = request.args.get("division_code", "").strip()
+    if not re.fullmatch(r"\d+", division):
+        return err("division_code must be numeric")
+    try:
+        return jsonify(_bd_request("/getAdminByCode", {
+            "level": "forDist",
+            "division_code": division,
+        }))
+    except RuntimeError as exc:
+        return err(str(exc), 502)
+
+
+@app.route("/api/bd/thanas")
+def api_bd_thanas():
+    division, district = (request.args.get(k, "").strip() for k in ("division_code", "district_code"))
+    if not re.fullmatch(r"\d+", division) or not re.fullmatch(r"\d+", district):
+        return err("division_code and district_code must be numeric")
+    try:
+        return jsonify(_bd_request("/getAdminByCode", {
+            "level": "forThana",
+            "division_code": division,
+            "district_code": district,
+        }))
+    except RuntimeError as exc:
+        return err(str(exc), 502)
+
+
+@app.route("/api/bd/mouzas")
+def api_bd_mouzas():
+    division, district, thana = (request.args.get(k, "").strip()
+                                 for k in ("division_code", "district_code", "thana_code"))
+    if not all(re.fullmatch(r"\d+", value) for value in (division, district, thana)):
+        return err("division_code, district_code and thana_code must be numeric")
+    try:
+        return jsonify(_bd_request("/getAdminByCode", {
+            "level": "forMauza",
+            "division_code": division,
+            "district_code": district,
+            "thana_code": thana,
+        }))
+    except RuntimeError as exc:
+        return err(str(exc), 502)
+
+
+@app.route("/api/bd/map-data")
+def api_bd_map_data():
+    level = request.args.get("level", "").strip()
+    table_name = request.args.get("tableName", "").strip()
+    allowed_levels = {"forDiv", "forDist", "forThana", "forMauza"}
+    if level not in allowed_levels or not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+        return err("invalid level or tableName")
+    fields = {"level": level, "tableName": table_name}
+    for name in ("divVal", "distVal", "thanaVal", "mauzaVal", "plotOrLanduse"):
+        value = request.args.get(name)
+        if value:
+            fields[name] = value
+    if any(not re.fullmatch(r"[A-Za-z0-9_.-]+", str(value)) for key, value in fields.items()
+           if key not in ("level", "tableName", "plotOrLanduse")):
+        return err("map values contain invalid characters")
+    try:
+        return jsonify(_bd_request("/getGeomByCode", fields))
+    except RuntimeError as exc:
+        return err(str(exc), 502)
+
+
 @app.route("/api/version")
 def api_version():
     return jsonify(sig=signature())
@@ -725,6 +848,7 @@ footer{border-top:1px solid var(--ln);padding:26px 0;color:var(--mu);font-size:1
 /* page heads */
 .phead{padding:30px 0 18px}.phead h1{font-size:30px}.phead p{color:var(--mu);margin:6px 0 0}
 .formrow{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;align-items:end}
+.mode-label{font-size:11px;color:var(--mu);margin-right:4px}.api-fields{margin-top:10px}
 /* verify */
 .vbanner{display:flex;gap:22px;align-items:center;border-radius:22px;padding:22px 26px;margin:20px 0;border:1px solid var(--ln)}
 .vbanner.safe{background:var(--gt)}.vbanner.caution{background:var(--wrt)}.vbanner.danger{background:var(--bdt)}
@@ -823,6 +947,7 @@ body.map-mode footer{display:none}
     <div class="seg" id="roleSeg"><button data-role="user" data-i18n="role_user"></button><button data-role="admin" data-i18n="role_admin"></button></div>
   </nav>
   <div class="tools">
+    <span class="mode-label" data-i18n="mode_label"></span><div class="seg" id="modeSeg"><button data-mode="dataset" data-i18n="mode_dataset"></button><button data-mode="api" data-i18n="mode_api"></button></div>
     <div class="seg" id="langSeg"><button data-lang="bn">বাং</button><button data-lang="en">EN</button></div>
     <button class="icon" id="themeBtn" title="Theme">🌓</button>
     <button class="icon burger" id="burger">☰</button>
@@ -836,11 +961,23 @@ body.map-mode footer{display:none}
       <span class="pill" data-i18n="hero_badge"></span>
       <h1 data-i18n="hero_h"></h1><p data-i18n="hero_p"></p>
       <div class="card searchcard">
-        <div class="row3">
+        <div id="datasetSearch">
+          <div class="row3">
           <label class="f"><span data-i18n="f_district"></span><select id="h_dist"></select></label>
           <label class="f"><span data-i18n="f_sheet"></span><select id="h_sheet"></select></label>
           <label class="f"><span data-i18n="f_plot"></span><input id="h_plot" list="h_plots"></label>
-        </div><datalist id="h_plots"></datalist>
+          </div><datalist id="h_plots"></datalist>
+        </div>
+        <div id="apiSearch" hidden>
+          <div class="row3 api-fields">
+            <label class="f"><span data-i18n="f_division"></span><select id="h_division"></select></label>
+            <label class="f"><span data-i18n="f_district"></span><select id="h_api_dist"></select></label>
+            <label class="f"><span data-i18n="f_thana"></span><select id="h_thana"></select></label>
+          </div>
+          <div class="row3 api-fields">
+            <label class="f"><span data-i18n="f_mouza"></span><select id="h_mouza"></select></label>
+          </div>
+        </div>
         <div class="btnrow"><button class="btn" id="h_map" data-i18n="btn_map"></button><button class="btn alt" id="h_ver" data-i18n="btn_verify"></button></div>
         <div class="or"><span data-i18n="or_place"></span></div>
         <div class="placebox"><input id="h_place" data-ph="place_ph"><button class="btn" id="h_go">📍</button></div>
@@ -923,18 +1060,20 @@ body.map-mode footer{display:none}
 <script>
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const BN='০১২৩৪৫৬৭৮৯';
-let lang=localStorage.lang||'bn',role=localStorage.role||'user';
+let lang=localStorage.lang||'bn',role=localStorage.role||'user',dataMode=localStorage.dataMode||'dataset';
 /* ---------- translations [bn, en] ---------- */
 const T={
 brand:["ভূমি দর্পণ","Bhumi Dorpon"],tagline:["বাংলাদেশ ভূমি তথ্য ও যাচাই","Bangladesh land info & verification"],
+mode_label:["ডেটা উৎস","Data source"],mode_dataset:["ডেমো ডেটা","Dataset"],mode_api:["সরকারি API","Government API"],
 nav_home:["হোম","Home"],nav_map:["ভূমি মানচিত্র","Land map"],nav_verify:["কেনার আগে যাচাই","Pre-purchase check"],nav_track:["নামজারি ট্র্যাকিং","Mutation tracking"],nav_admin:["অ্যাডমিন টুলস","Admin tools"],
 role_user:["ব্যবহারকারী","User"],role_admin:["অ্যাডমিন","Admin"],
 hero_badge:["ডিজিটাল ভূমি সেবা • বাংলাদেশ","Digital Land Services • Bangladesh"],
 hero_h:["আপনার জমি খুঁজুন, মানচিত্রে দেখুন, নিশ্চিন্তে কিনুন","Find your land, see it on the map, buy with confidence"],
 hero_p:["জেলা ও শিট বেছে দাগ নম্বর দিন — মালিকানা, নামজারির ইতিহাস, মামলা ও খাস জমির তথ্য এক জায়গায়।","Pick a district & sheet, enter the plot number — ownership, mutation history, cases and khas status in one place."],
 f_district:["জেলা","District"],f_sheet:["শিট","Sheet"],f_plot:["দাগ নম্বর","Plot no."],sel_district:["জেলা নির্বাচন করুন","Select district"],sel_sheet:["শিট নির্বাচন করুন","Select sheet"],all_sheets:["সব শিট","All sheets"],
+f_division:["বিভাগ","Division"],f_thana:["থানা / উপজেলা","Thana / Upazila"],f_mouza:["মৌজা","Mouza"],sel_division:["বিভাগ নির্বাচন করুন","Select division"],sel_thana:["থানা নির্বাচন করুন","Select thana"],sel_mouza:["মৌজা নির্বাচন করুন","Select mouza"],
 btn_map:["মানচিত্রে দেখুন","View on map"],btn_verify:["কেনার আগে যাচাই","Verify before buying"],or_place:["অথবা এলাকা খুঁজুন","or search an area"],place_ph:["গ্রাম, ইউনিয়ন বা স্থানের নাম…","Village, union or place name…"],
-need_dist:["আগে জেলা নির্বাচন করুন","Select a district first"],need_plot:["শিট ও দাগ নম্বর দিন","Select sheet and enter plot no."],
+need_dist:["আগে জেলা নির্বাচন করুন","Select a district first"],need_plot:["শিট ও দাগ নম্বর দিন","Select sheet and enter plot no."],need_api_area:["বিভাগ, জেলা, থানা ও মৌজা নির্বাচন করুন","Select division, district, thana and mouza"],
 mock_safe:["মালিকানা যাচাইকৃত","Ownership verified"],mock_alert:["জাল দলিল সন্দেহ","Forged deed suspected"],
 stat_ds:["ডেটাসেট (শিট)","Datasets (sheets)"],stat_plots:["দাগ / প্লট","Plots"],stat_checks:["স্বয়ংক্রিয় যাচাই","Automated checks"],stat_alerts:["জালিয়াতি সতর্কতা","Fraud alerts"],stat_cases:["নামজারি কেস","Mutation cases"],
 feat_h:["এক প্ল্যাটফর্মে সব ভূমি সেবা","All land services on one platform"],feat_p:["নাগরিক ও কর্মকর্তা — উভয়ের জন্য স্বচ্ছ, দ্রুত ও নিরাপদ।","Transparent, fast and safe — for citizens and officers alike."],
@@ -1014,7 +1153,7 @@ const PALETTE={'Commercial Area':'#e63946','Settlement':'#f4a261','Agriculture':
 const colorOf=c=>PALETTE[c]||`hsl(${[...(c||'?')].reduce((a,ch)=>a*31+ch.charCodeAt(0)>>>0,7)%360} 65% 50%)`;
 const STAGES=['registration','auto_check','union_office','ac_land','approved','khatian'];
 const FT=['fake_deed','double_sale','rapid','mismatch'];
-let DSL=[],STATS={},VR=null,TC=null,cur={path:'/',q:new URLSearchParams()};
+let DSL=[],STATS={},VR=null,TC=null,cur={path:'/',q:new URLSearchParams()},BD={divisions:[],districts:[],thanas:[],mouzas:[]};
 
 /* ---------- datasets / selectors ---------- */
 const districts=()=>{const m=new Map();DSL.forEach(d=>m.set(d.district,d));return[...m.values()]};
@@ -1027,13 +1166,22 @@ function cascade(dEl,sEl,all,cb){const dv=dEl.value,sv=sEl.value;fillDist(dEl,dv
   dEl.onchange=()=>{fillSheet(sEl,dEl.value,'',all);cb&&cb('d')};sEl.onchange=()=>cb&&cb('s')}
 const fillPlots=(el,ds)=>{el.innerHTML='';if(ds&&ds!=='*')api('/api/plots/'+encodeURIComponent(ds)).then(a=>el.innerHTML=a.map(p=>`<option value="${esc(p.plot_no)}">${esc(p.label)}</option>`).join('')).catch(()=>{})};
 const bbOf=d=>[[d.bbox[0],d.bbox[1]],[d.bbox[2],d.bbox[3]]];
+const optionText=x=>lang==='bn'?(x.name_bn||x.name_en):(x.name_en||x.name_bn);
+const fillApiSelect=(el,items,placeholder)=>{el.innerHTML=`<option value="">${t(placeholder)}</option>`+items.map(x=>`<option value="${esc(x.code)}">${esc(optionText(x))}</option>`).join('')};
+async function loadApiDivisions(){if(!BD.divisions.length)BD.divisions=await api('/api/bd/divisions');fillApiSelect($('#h_division'),BD.divisions,'sel_division')}
+async function loadApiDistricts(code){BD.districts=await api('/api/bd/districts?division_code='+encodeURIComponent(code));fillApiSelect($('#h_api_dist'),BD.districts,'sel_district');$('#h_thana').innerHTML=`<option value="">${t('sel_thana')}</option>`;$('#h_mouza').innerHTML=`<option value="">${t('sel_mouza')}</option>`}
+async function loadApiThanas(division,code){BD.thanas=await api(`/api/bd/thanas?division_code=${encodeURIComponent(division)}&district_code=${encodeURIComponent(code)}`);fillApiSelect($('#h_thana'),BD.thanas,'sel_thana');$('#h_mouza').innerHTML=`<option value="">${t('sel_mouza')}</option>`}
+async function loadApiMouzas(division,district,code){BD.mouzas=await api(`/api/bd/mouzas?division_code=${encodeURIComponent(division)}&district_code=${encodeURIComponent(district)}&thana_code=${encodeURIComponent(code)}`);fillApiSelect($('#h_mouza'),BD.mouzas,'sel_mouza')}
+function setMode(mode){dataMode=mode;localStorage.dataMode=mode;$('#modeSeg button[data-mode="dataset"]').classList.toggle('on',mode==='dataset');$('#modeSeg button[data-mode="api"]').classList.toggle('on',mode==='api');$('#datasetSearch').hidden=mode!=='dataset';$('#apiSearch').hidden=mode!=='api';if(mode==='api')loadApiDivisions().catch(e=>toast(e.message))}
 
 /* ---------- static i18n ---------- */
 function applyStatic(){document.documentElement.lang=lang;document.title=t('brand')+' — '+t('tagline');
   $$('[data-i18n]').forEach(e=>e.textContent=t(e.dataset.i18n));$$('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
   $$('#langSeg button').forEach(b=>b.classList.toggle('on',b.dataset.lang===lang));$$('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.role===role));
+  $$('#modeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.mode===dataMode));setMode(dataMode);
   $('#navAdmin').style.display=role==='admin'?'':'none'}
 $('#langSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;lang=b.dataset.lang;localStorage.lang=lang;applyStatic();route(true)};
+$('#modeSeg').onclick=e=>{const b=e.target.closest('button');if(b)setMode(b.dataset.mode)};
 $('#roleSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;role=b.dataset.role;localStorage.role=role;applyStatic();
   if(role==='admin'&&cur.path.indexOf('/admin')!==0)location.hash='#/admin';else if(role==='user'&&cur.path.indexOf('/admin')===0)location.hash='#/';else route(true)};
 $('#themeBtn').onclick=()=>{const n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.theme=n};
@@ -1053,15 +1201,19 @@ addEventListener('hashchange',()=>route(false));
 /* ---------- home ---------- */
 function renderHome(){
   $('#h_stats').innerHTML=[['stat_ds',STATS.datasets],['stat_plots',STATS.plots],['stat_checks',STATS.checks],['stat_alerts',STATS.alerts],['stat_cases',STATS.cases]].map(([k,v])=>`<div class="stat"><b>${nf(v||0,0)}</b><span>${t(k)}</span></div>`).join('');
+  setMode(dataMode);
   cascade($('#h_dist'),$('#h_sheet'),false,w=>{if(w==='s')fillPlots($('#h_plots'),$('#h_sheet').value)});fillPlots($('#h_plots'),$('#h_sheet').value)}
-$('#h_map').onclick=()=>{const d=$('#h_dist').value,s=$('#h_sheet').value,p=$('#h_plot').value.trim();if(!d)return toast(t('need_dist'));
+$('#h_division').onchange=()=>{if($('#h_division').value)loadApiDistricts($('#h_division').value).catch(e=>toast(e.message))};
+$('#h_api_dist').onchange=()=>{if($('#h_api_dist').value)loadApiThanas($('#h_division').value,$('#h_api_dist').value).catch(e=>toast(e.message))};
+$('#h_thana').onchange=()=>{if($('#h_thana').value)loadApiMouzas($('#h_division').value,$('#h_api_dist').value,$('#h_thana').value).catch(e=>toast(e.message))};
+$('#h_map').onclick=()=>{if(dataMode==='api'){const d=$('#h_division').value,di=$('#h_api_dist').value,tv=$('#h_thana').value,m=$('#h_mouza').value;if(!d||!di||!tv||!m)return toast(t('need_api_area'));location.hash=`#/map?api=1&division=${d}&district=${di}&thana=${tv}&mouza=${m}`;return}const d=$('#h_dist').value,s=$('#h_sheet').value,p=$('#h_plot').value.trim();if(!d)return toast(t('need_dist'));
   const ids=s?[s]:sheetsOf(d).map(x=>x.id);location.hash=`#/map?ds=${ids.join(',')}${p&&ids.length===1?'&plot='+encodeURIComponent(p):''}`};
-$('#h_ver').onclick=()=>{const s=$('#h_sheet').value,p=$('#h_plot').value.trim();if(!s||!p)return toast(t('need_plot'));location.hash=`#/verify?ds=${s}&plot=${encodeURIComponent(p)}`};
+$('#h_ver').onclick=()=>{if(dataMode==='api'){return $('#h_map').click()}const s=$('#h_sheet').value,p=$('#h_plot').value.trim();if(!s||!p)return toast(t('need_plot'));location.hash=`#/verify?ds=${s}&plot=${encodeURIComponent(p)}`};
 const goPlace=()=>{const v=$('#h_place').value.trim();if(v)location.hash='#/map?place='+encodeURIComponent(v)};
 $('#h_go').onclick=goPlace;$('#h_place').onkeydown=e=>{if(e.key==='Enter')goPlace()};
 
 /* ---------- map ---------- */
-let map,landG,plotG,ovG,baseLayer,baseKey='satl',loaded=[],DATA=null,plotLayers={},selLayer=null,curSel=null,hiddenCls=new Set(),mapReady=false,pinMark=null,busy=false,searchT;
+let map,landG,plotG,apiG,ovG,baseLayer,baseKey='satl',loaded=[],DATA=null,API_DATA=null,plotLayers={},selLayer=null,curSel=null,hiddenCls=new Set(),mapReady=false,pinMark=null,busy=false,searchT;
 const esri='https://server.arcgisonline.com/ArcGIS/rest/services/';
 const BASES={
  sat:()=>L.tileLayer(esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:19,maxZoom:22,attribution:'Tiles © Esri'}),
@@ -1077,7 +1229,7 @@ function initMap(){
   map=L.map('map',{zoomControl:false,maxZoom:22}).setView([23.7,90.35],7);
   L.control.zoom({position:'bottomright'}).addTo(map);L.control.scale({imperial:false,position:'bottomleft'}).addTo(map);
   map.createPane('landPane').style.zIndex=410;map.createPane('plotPane').style.zIndex=420;
-  landG=L.layerGroup().addTo(map);plotG=L.layerGroup().addTo(map);ovG=L.layerGroup().addTo(map);setBase('satl');
+  landG=L.layerGroup().addTo(map);plotG=L.layerGroup().addTo(map);apiG=L.layerGroup().addTo(map);ovG=L.layerGroup().addTo(map);setBase('satl');
   $('#lyLand').onchange=e=>e.target.checked?landG.addTo(map):map.removeLayer(landG);
   $('#lyPlot').onchange=e=>e.target.checked?plotG.addTo(map):map.removeLayer(plotG);
   $('#lbl').onchange=updateLabels;map.on('zoomend',updateLabels);map.on('moveend',autoLoad);
@@ -1092,8 +1244,47 @@ function updateLabels(){map.getContainer().classList.toggle('nolabels',!$('#lbl'
 function fitData(){if(!DATA)return fitAll();const g=L.geoJSON([...DATA.plot.features,...DATA.land.features]);if(g.getLayers().length)map.fitBounds(g.getBounds(),{padding:[50,50]})}
 function fitAll(){const b=DSL.filter(d=>d.bbox).flatMap(d=>bbOf(d));if(b.length)map.fitBounds(b,{padding:[60,60],maxZoom:12})}
 function mapUrl(plot){history.replaceState(null,'','#/map'+(loaded.length?`?ds=${loaded.join(',')}${plot?'&plot='+encodeURIComponent(plot):''}`:''))}
+function wktGeo(wkt){
+  const m=/^\s*(MULTIPOLYGON|POLYGON)\s*(\(.*\))\s*$/is.exec(wkt||'');if(!m)return null;
+  const stack=[[]],tokens=m[2].match(/\(|\)|[^()]+/g)||[];
+  for(const token of tokens){
+    if(token==='(')stack.push([]);
+    else if(token===')'){if(stack.length<2)return null;const node=stack.pop();stack[stack.length-1].push(node)}
+    else stack[stack.length-1].push(...token.split(',').map(p=>p.trim().split(/\s+/).slice(0,2).map(Number)).filter(p=>p.length===2&&p.every(Number.isFinite)));
+  }
+  if(stack.length!==1||!stack[0].length)return null;
+  const kind=m[1].toUpperCase(),coordinates=stack[0][0];
+  return {type:kind==='POLYGON'?'Polygon':'MultiPolygon',coordinates};
+}
+function apiFeatures(payload,key){const rows=payload&&payload[key]||[];return rows.map((row,i)=>{const geometry=wktGeo(row.geom);return geometry?{type:'Feature',properties:{...row,_api:true,_key:i},geometry}:null}).filter(Boolean)}
+async function loadApiMap(q){
+  const division=q.get('division'),district=q.get('district'),thana=q.get('thana'),mouza=q.get('mouza');
+  if(!BD.divisions.some(x=>x.code===division))BD.divisions=await api('/api/bd/divisions');
+  if(!BD.districts.some(x=>x.code===district))BD.districts=await api('/api/bd/districts?division_code='+encodeURIComponent(division));
+  if(!BD.thanas.some(x=>x.code===thana))BD.thanas=await api(`/api/bd/thanas?division_code=${encodeURIComponent(division)}&district_code=${encodeURIComponent(district)}`);
+  if(!BD.mouzas.some(x=>x.code===mouza))BD.mouzas=await api(`/api/bd/mouzas?division_code=${encodeURIComponent(division)}&district_code=${encodeURIComponent(district)}&thana_code=${encodeURIComponent(thana)}`);
+  const boundary=await api(`/api/bd/map-data?level=forThana&tableName=gis_boundary_upazila&thanaVal=${encodeURIComponent(thana)}`);
+  const divisionInfo=BD.divisions.find(x=>x.code===division),districtInfo=BD.districts.find(x=>x.code===district),thanaInfo=BD.thanas.find(x=>x.code===thana),mouzaInfo=BD.mouzas.find(x=>x.code===mouza);
+  const mcode=mouzaInfo&&mouzaInfo.m_code;
+  const [plots,land]=mcode?await Promise.all([
+    api(`/api/bd/map-data?level=forMauza&tableName=${encodeURIComponent(mcode.toLowerCase())}&mauzaVal=${encodeURIComponent(mouza)}&plotOrLanduse=plot`),
+    api(`/api/bd/map-data?level=forMauza&tableName=${encodeURIComponent(mcode.toLowerCase())}&mauzaVal=${encodeURIComponent(mouza)}&plotOrLanduse=landuse`)
+  ]):[{},{}];
+  API_DATA={boundary,plot:{type:'FeatureCollection',features:apiFeatures(plots,'plots')},land:{type:'FeatureCollection',features:apiFeatures(land,'landuse')},label:(mouzaInfo&&optionText(mouzaInfo))||'API area',division:divisionInfo&&optionText(divisionInfo),district:districtInfo&&optionText(districtInfo),thana:thanaInfo&&optionText(thanaInfo)};
+  apiG.clearLayers();
+  const layers=[];
+  if(boundary&&boundary.geom){const g=wktGeo(boundary.geom);if(g)layers.push(L.geoJSON(g,{style:{color:'#00e5ff',weight:3,fillOpacity:.08}}))}
+  L.geoJSON(API_DATA.land,{style:f=>({color:'#166534',weight:1,fillColor:colorOf(f.properties.maj_class),fillOpacity:.38})}).addTo(apiG);
+  L.geoJSON(API_DATA.plot,{style:{color:'#ffd60a',weight:2,fillOpacity:.04},onEachFeature:(f,l)=>l.bindTooltip(String(f.properties.label||f.properties.plot_no_en||''),{permanent:true,className:'plot-lbl'})}).addTo(apiG);
+  layers.forEach(l=>l.addTo(apiG));const all=apiG.getLayers();if(all.length){const group=L.featureGroup(all);map.fitBounds(group.getBounds(),{padding:[55,55],maxZoom:18})}
+  $('#sub').textContent=`${API_DATA.label} · ${API_DATA.thana||''} · API`;
+  $('#mstats').innerHTML=[[API_DATA.plot.features.length,'m_total'],[API_DATA.land.features.length,'m_parts'],['—','m_area'],[new Set(API_DATA.land.features.map(f=>f.properties.maj_class)).size,'m_cls']].map(([v,k])=>`<div><b>${typeof v==='number'?nf(v,0):v}</b><span>${t(k)}</span></div>`).join('');
+  $('#legend').innerHTML=`<small>${esc(API_DATA.division||'')} · ${esc(API_DATA.district||'')} · ${esc(API_DATA.thana||'')} · ${esc(API_DATA.label||'')}</small>`;
+}
 async function showMap(q,keep){
   initMap();setTimeout(()=>map.invalidateSize(),60);
+  if(q.get('api')==='1'){landG.clearLayers();plotG.clearLayers();ovG.clearLayers();loaded=[];DATA=null;$('#drawer').hidden=true;try{await loadApiMap(q)}catch(e){toast(e.message)}return}
+  apiG.clearLayers();API_DATA=null;
   cascade($('#m_dist'),$('#m_sheet'),true,w=>{const d=$('#m_dist').value,s=$('#m_sheet').value;if(!d)return loadIds([]);loadIds(s&&s!=='*'?[s]:sheetsOf(d).map(x=>x.id))});
   renderBases();sidebar();
   if(keep){if(curSel)showDrawer(curSel[0],curSel[1]);return}
