@@ -1172,7 +1172,7 @@ label.f{display:block;font-size:13px;color:var(--mu);font-weight:500}label.f>*:l
 .badge.warn,.badge.caution,.badge.medium,.badge.delayed,.badge.investigating{background:var(--wrt);color:var(--wr)}
 .badge.fail,.badge.danger,.badge.high,.badge.flagged,.badge.rejected,.badge.new{background:var(--bdt);color:var(--bd)}
 /* home */
-.hero{position:relative;isolation:isolate;background:linear-gradient(90deg,color-mix(in srgb,var(--bg) 96%,transparent) 0%,color-mix(in srgb,var(--bg) 82%,transparent) 48%,color-mix(in srgb,var(--bg) 28%,transparent) 100%),url('/assets/heto_1.jpeg') center/cover no-repeat;padding:72px 0 54px;min-height:610px}
+.hero{position:relative;isolation:isolate;background:linear-gradient(90deg,color-mix(in srgb,var(--bg) 96%,transparent) 0%,color-mix(in srgb,var(--bg) 82%,transparent) 48%,color-mix(in srgb,var(--bg) 28%,transparent) 100%),url('/assets/heto_1.jpeg') center/cover no-repeat;padding:72px 0 54px;min-height:calc(100vh - var(--nav))}
 .hero:after{content:'';position:absolute;inset:0;z-index:-1;background:linear-gradient(135deg,color-mix(in srgb,var(--g) 18%,transparent),transparent 55%,color-mix(in srgb,var(--g2) 12%,transparent))}
 .hero-in{display:grid;grid-template-columns:minmax(0,720px);gap:36px;align-items:center}
 .hero-in>div:first-child{position:relative;z-index:1}
@@ -1190,9 +1190,11 @@ label.f{display:block;font-size:13px;color:var(--mu);font-weight:500}label.f>*:l
 .mock i:nth-child(3n){background:#f4a261}.mock i:nth-child(5n){background:#8ab17d}.mock i:nth-child(7n){background:#38bdf8}.mock i:nth-child(4){background:#e63946}
 .float{position:absolute;background:var(--sf);border:1px solid var(--ln);border-radius:14px;padding:10px 14px;font-weight:600;font-size:14px;box-shadow:var(--sh)}
 .f1{left:-14px;bottom:44px;color:var(--g)}.f2{right:-6px;top:18px;color:var(--bd)}
-.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:-8px;padding-top:6px}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:0 auto;padding:42px 20px 18px}
 .stat{background:var(--sf);border:1px solid var(--ln);border-radius:16px;padding:16px;text-align:center}
 .stat b{display:block;font-size:26px;color:var(--g)}.stat span{font-size:13px;color:var(--mu)}
+.home-reveal{opacity:0;transform:translateY(28px);transition:opacity .7s ease,transform .7s ease}
+.home-reveal.is-visible{opacity:1;transform:none}
 .sec{padding:46px 0}.sec h2{font-size:clamp(24px,3vw,32px);margin-bottom:8px}.sec>.container>p{color:var(--mu);margin:0 0 26px}
 .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
 .feat{cursor:pointer;transition:.2s}.feat:hover{transform:translateY(-4px);border-color:var(--g2)}
@@ -1435,20 +1437,20 @@ main{margin-left:var(--side-nav);transition:margin-left .25s}
       </div>
     </div>
   </div></div>
-  <div class="container stats" id="h_stats"></div>
-  <div class="sec"><div class="container"><h2 data-i18n="feat_h"></h2><p data-i18n="feat_p"></p>
+  <div class="container stats home-reveal" id="h_stats"></div>
+  <div class="sec home-reveal"><div class="container"><h2 data-i18n="feat_h"></h2><p data-i18n="feat_p"></p>
     <div class="grid4">
       <div class="card feat" data-go="#/map"><div class="ic"><i data-ic="map" data-s="24"></i></div><h3 data-i18n="feat_map_t"></h3><p data-i18n="feat_map_d"></p></div>
       <div class="card feat" data-go="#/verify"><div class="ic"><i data-ic="search" data-s="24"></i></div><h3 data-i18n="feat_ver_t"></h3><p data-i18n="feat_ver_d"></p></div>
       <div class="card feat" data-go="#/track"><div class="ic"><i data-ic="file" data-s="24"></i></div><h3 data-i18n="feat_mut_t"></h3><p data-i18n="feat_mut_d"></p></div>
       <div class="card feat" data-go="#/admin"><div class="ic"><i data-ic="shield" data-s="24"></i></div><h3 data-i18n="feat_fraud_t"></h3><p data-i18n="feat_fraud_d"></p></div>
     </div></div></div>
-  <div class="container"><div class="band"><h2 data-i18n="fraud_h"></h2><div class="grid4">
+  <div class="container home-reveal"><div class="band"><h2 data-i18n="fraud_h"></h2><div class="grid4">
     <div><h4 data-i18n="ft_fake_deed"></h4><p data-i18n="ftd_fake_deed"></p></div>
     <div><h4 data-i18n="ft_double_sale"></h4><p data-i18n="ftd_double_sale"></p></div>
     <div><h4 data-i18n="ft_rapid"></h4><p data-i18n="ftd_rapid"></p></div>
     <div><h4 data-i18n="ft_mismatch"></h4><p data-i18n="ftd_mismatch"></p></div></div></div></div>
-  <div class="sec"><div class="container"><h2 data-i18n="steps_h"></h2><p></p><div class="grid3">
+  <div class="sec home-reveal"><div class="container"><h2 data-i18n="steps_h"></h2><p></p><div class="grid3">
     <div class="step"><span class="n">১</span><div><h4 data-i18n="st1_t"></h4><p data-i18n="st1_d"></p></div></div>
     <div class="step"><span class="n">২</span><div><h4 data-i18n="st2_t"></h4><p data-i18n="st2_d"></p></div></div>
     <div class="step"><span class="n">৩</span><div><h4 data-i18n="st3_t"></h4><p data-i18n="st3_d"></p></div></div></div>
@@ -1747,6 +1749,9 @@ addEventListener('hashchange',()=>route(false));
 /* ---------- home ---------- */
 function renderHome(){
   $('#h_stats').innerHTML=[['stat_ds',STATS.datasets],['stat_plots',STATS.plots],['stat_checks',STATS.checks],['stat_alerts',STATS.alerts],['stat_cases',STATS.cases]].map(([k,v])=>`<div class="stat"><b>${nf(v||0,0)}</b><span>${t(k)}</span></div>`).join('');
+  const reveal=$$('.home-reveal');
+  if('IntersectionObserver' in window){const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting){entry.target.classList.add('is-visible');observer.unobserve(entry.target)}}),{threshold:.12});reveal.forEach(e=>observer.observe(e))}
+  else reveal.forEach(e=>e.classList.add('is-visible'));
   applyModeUI();
   cascade($('#h_dist'),$('#h_sheet'),false,w=>{if(w==='s')fillPlots($('#h_plots'),$('#h_sheet').value)});fillPlots($('#h_plots'),$('#h_sheet').value)}
 $('#h_map').onclick=async()=>{
