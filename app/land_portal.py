@@ -1070,6 +1070,11 @@ def hero_image():
     return send_file(os.path.join(BASE, "src", "img", "heto_1.jpeg"), mimetype="image/jpeg")
 
 
+@app.route("/assets/logo.png")
+def logo_image():
+    return send_file(os.path.join(BASE, "src", "img", "logo.png"), mimetype="image/png")
+
+
 # ----------------------------------------------------------------- demo data
 DEMO = [("gazipur_001", 24.0023, 90.4264, "গাজীপুর সদর"), ("dhaka_014", 23.8583, 90.2667, "সাভার"),
         ("cumilla_007", 23.4607, 91.1809, "কুমিল্লা সদর")]
@@ -1141,8 +1146,8 @@ h1,h2,h3,h4{margin:0;line-height:1.25}
 /* nav */
 .nav{position:sticky;top:0;z-index:2000;height:var(--nav);background:var(--top-nav);backdrop-filter:blur(14px);border-bottom:1px solid var(--ln)}
 .nav-in{height:100%;max-width:1280px;margin:0 auto;padding:0 18px;display:flex;align-items:center;gap:14px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:var(--g)}
-.logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,var(--g),var(--g2));display:grid;place-items:center;font-size:19px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:var(--g);flex-shrink:0}
+.logo{display:block;width:156px;height:50px;object-fit:contain;object-position:left center}
 .nav-links{display:flex;align-items:center;gap:4px;margin-left:18px;flex:1;min-width:0}
 .nav-links a{padding:8px 13px;border-radius:10px;color:var(--mu);font-weight:500;font-size:15px;white-space:nowrap;flex-shrink:0}
 .nav-links a:hover{background:var(--sf2);color:var(--tx)}.nav-links a.on{background:var(--gt);color:var(--g)}
@@ -1307,11 +1312,14 @@ h1,h2,h3,h4{line-height:1.35}
 input,select,textarea,button{font-family:inherit;line-height:1.5}
 textarea{font:inherit;color:var(--tx);background:var(--sf2);border:1px solid var(--ln);border-radius:11px;padding:10px 12px;width:100%;outline:none;resize:vertical;min-height:84px}
 textarea:focus{border-color:var(--g2);box-shadow:0 0 0 3px color-mix(in srgb,var(--g2) 22%,transparent)}
-html[lang=bn] body{line-height:1.75}
+html[lang=bn] body{font-family:'Noto Sans Bengali','Hind Siliguri','Inter','Nirmala UI','Kalpurush','Vrinda',system-ui,sans-serif;line-height:1.75;font-variant-numeric:normal}
 html[lang=bn] *{letter-spacing:0!important;text-transform:none!important}
 html[lang=bn] .badge,html[lang=bn] .tag,html[lang=bn] .chip,html[lang=bn] .fchip{line-height:1.7;padding-top:3px;padding-bottom:3px}
 html[lang=bn] .btn,html[lang=bn] .seg button{line-height:1.6}
 html[lang=bn] th{font-size:13px}
+html[lang=bn] .stat b,html[lang=bn] .stat span,html[lang=bn] .step .n{font-family:'Noto Sans Bengali','Hind Siliguri','Nirmala UI','Kalpurush','Vrinda',system-ui,sans-serif;font-variant-numeric:normal}
+html[lang=bn] .stat span{line-height:1.5}
+html[lang=bn] .step .n{font-size:18px;line-height:1;font-weight:700}
 .ico{flex:none;vertical-align:-3px;display:inline-block}
 [data-ic]{display:inline-flex;align-items:center;justify-content:center;line-height:0}
 .icon{display:inline-grid;place-items:center;padding:0;transition:.15s}.icon:hover{background:var(--sf2)}
@@ -1346,7 +1354,7 @@ a:focus-visible,button:focus-visible,.rw:focus-visible{outline:2px solid var(--g
 }
 @media(max-width:560px){
  dialog{width:100%;max-width:100%;margin:auto 0 0;border-radius:22px 22px 0 0;max-height:92vh}
- .container{padding:0 14px}.hero{padding:34px 0 24px}.brand span:last-child{font-size:16px}
+ .container{padding:0 14px}.hero{padding:34px 0 24px}.brand span:last-child{font-size:16px}.logo{width:136px;height:46px}
 }
 @media(min-width:1400px){.container{max-width:1280px}}
 /* primary navigation layout */
@@ -1387,7 +1395,7 @@ main{margin-left:var(--side-nav);transition:margin-left .25s}
 </head>
 <body>
 <header class="nav"><div class="nav-in">
-  <a class="brand" href="#/"><span class="logo"><i data-ic="leaf" data-s="20"></i></span><span data-i18n="brand"></span></a>
+  <a class="brand" href="#/" aria-label="AmarBhumi"><img class="logo" src="/assets/logo.png" alt="AmarBhumi আমার ভূমি"></a>
   <div class="tools">
     <span class="avatar" aria-hidden="true">U</span>
     <div class="seg" id="roleSeg"><button data-role="user" data-i18n="role_user"></button><button data-role="admin" data-i18n="role_admin"></button></div>
