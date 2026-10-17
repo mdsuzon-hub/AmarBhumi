@@ -39,7 +39,7 @@ import webbrowser
 import zlib
 from datetime import date, timedelta
 
-from flask import Flask, Response, jsonify, redirect, request, has_request_context
+from flask import Flask, Response, jsonify, redirect, request, has_request_context, send_file
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE, "data")
@@ -1065,6 +1065,11 @@ def index_page():
     return Response(PAGE.replace("<!--HARDEN-->", HARDEN_HTML if HARDEN["on"] else ""), mimetype="text/html")
 
 
+@app.route("/assets/heto_1.jpeg")
+def hero_image():
+    return send_file(os.path.join(BASE, "src", "img", "heto_1.jpeg"), mimetype="image/jpeg")
+
+
 # ----------------------------------------------------------------- demo data
 DEMO = [("gazipur_001", 24.0023, 90.4264, "গাজীপুর সদর"), ("dhaka_014", 23.8583, 90.2667, "সাভার"),
         ("cumilla_007", 23.4607, 91.1809, "কুমিল্লা সদর")]
@@ -1167,8 +1172,10 @@ label.f{display:block;font-size:13px;color:var(--mu);font-weight:500}label.f>*:l
 .badge.warn,.badge.caution,.badge.medium,.badge.delayed,.badge.investigating{background:var(--wrt);color:var(--wr)}
 .badge.fail,.badge.danger,.badge.high,.badge.flagged,.badge.rejected,.badge.new{background:var(--bdt);color:var(--bd)}
 /* home */
-.hero{background:radial-gradient(1000px 500px at 85% -10%,color-mix(in srgb,var(--g2) 25%,transparent),transparent),linear-gradient(180deg,var(--gt),var(--bg));padding:54px 0 36px}
-.hero-in{display:grid;grid-template-columns:1.15fr .85fr;gap:36px;align-items:center}
+.hero{position:relative;isolation:isolate;background:linear-gradient(90deg,color-mix(in srgb,var(--bg) 96%,transparent) 0%,color-mix(in srgb,var(--bg) 82%,transparent) 48%,color-mix(in srgb,var(--bg) 28%,transparent) 100%),url('/assets/heto_1.jpeg') center/cover no-repeat;padding:72px 0 54px;min-height:610px}
+.hero:after{content:'';position:absolute;inset:0;z-index:-1;background:linear-gradient(135deg,color-mix(in srgb,var(--g) 18%,transparent),transparent 55%,color-mix(in srgb,var(--g2) 12%,transparent))}
+.hero-in{display:grid;grid-template-columns:minmax(0,720px);gap:36px;align-items:center}
+.hero-in>div:first-child{position:relative;z-index:1}
 .pill{display:inline-block;background:var(--sf);border:1px solid var(--ln);color:var(--g);padding:5px 14px;border-radius:99px;font-size:13px;font-weight:600}
 .hero h1{font-size:clamp(30px,4.4vw,50px);margin:16px 0 12px;font-weight:700}
 .hero p{color:var(--mu);font-size:18px;margin:0 0 22px;max-width:560px}
@@ -1177,6 +1184,7 @@ label.f{display:block;font-size:13px;color:var(--mu);font-weight:500}label.f>*:l
 .or{display:flex;align-items:center;gap:10px;color:var(--mu);font-size:12px}.or:before,.or:after{content:'';flex:1;height:1px;background:var(--ln)}
 .placebox{display:flex;gap:8px}
 .hero-art{position:relative;min-height:330px}
+.hero-image{display:block;width:100%;height:auto;aspect-ratio:1373 / 784;object-fit:cover;border:1px solid var(--ln);border-radius:24px;box-shadow:var(--sh);filter:saturate(.9)}
 .mock{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;transform:rotate(-4deg);padding:16px;background:var(--sf);border:1px solid var(--ln);border-radius:24px;box-shadow:var(--sh)}
 .mock i{display:block;aspect-ratio:1.15;border-radius:9px;border:2px solid #ffd60a;background:var(--g2);opacity:.85}
 .mock i:nth-child(3n){background:#f4a261}.mock i:nth-child(5n){background:#8ab17d}.mock i:nth-child(7n){background:#38bdf8}.mock i:nth-child(4){background:#e63946}
@@ -1283,7 +1291,7 @@ body.map-mode footer{display:none}
 #loader .card{width:min(420px,92vw)}.pbar{height:8px;background:var(--sf2);border-radius:6px;overflow:hidden;margin:12px 0}
 .pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--g),var(--g2));transition:width .3s}
 
-@media(max-width:960px){.hero-in{grid-template-columns:1fr}.hero-art{display:none}.stats{grid-template-columns:repeat(3,1fr)}.grid4{grid-template-columns:repeat(2,1fr)}.grid3{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(3,1fr)}.formrow{grid-template-columns:1fr 1fr}}
+@media(max-width:960px){.hero{background-position:58% center}.hero-in{grid-template-columns:1fr}.hero-art{display:none}.stats{grid-template-columns:repeat(3,1fr)}.grid4{grid-template-columns:repeat(2,1fr)}.grid3{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(3,1fr)}.formrow{grid-template-columns:1fr 1fr}}
 @media(max-width:760px){.burger{display:block}.nav-links{display:none;position:absolute;top:var(--nav);left:0;right:0;background:var(--sf);border-bottom:1px solid var(--ln);flex-direction:column;align-items:stretch;padding:10px;margin:0}
 .nav-links.open{display:flex}#roleSeg{margin:6px 0 0;align-self:flex-start}.brand span:last-child{font-size:17px}
 .row3{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.grid4{grid-template-columns:1fr}.vgrid,.two{grid-template-columns:1fr}.vbanner{flex-direction:column;text-align:center}.kpis{grid-template-columns:repeat(2,1fr)}.formrow{grid-template-columns:1fr}.bar{grid-template-columns:110px 1fr 30px}
@@ -1426,8 +1434,6 @@ main{margin-left:var(--side-nav);transition:margin-left .25s}
         <div class="placebox"><input id="h_place" data-ph="place_ph"><button class="btn" id="h_go" aria-label="Search"><i data-ic="pin" data-s="18"></i></button></div>
       </div>
     </div>
-    <div class="hero-art"><div class="mock"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-      <div class="float f1"><i data-ic="shield" data-s="18"></i> <span data-i18n="mock_safe"></span></div><div class="float f2"><i data-ic="alert" data-s="18"></i> <span data-i18n="mock_alert"></span></div></div>
   </div></div>
   <div class="container stats" id="h_stats"></div>
   <div class="sec"><div class="container"><h2 data-i18n="feat_h"></h2><p data-i18n="feat_p"></p>
