@@ -6,16 +6,18 @@
     python land_portal.py                 # http://127.0.0.1:5000
     python land_portal.py --port 8000 --no-browser
 
-Data files (auto-discovered, hot-reloaded):
-    data/<district>_<sheet>_land.json     e.g. data/gazipur_001_land.json
-    data/<district>_<sheet>_plot.json     e.g. data/gazipur_001_plot.json
-  (files next to this script, and legacy land.json / plot.json, work too.)
-  Records: {"geom": "POLYGON((lon lat, ...))", "plot_no_en": "123", "label": "১২৩",
-            "m_code": "3601", "maj_class": "Settlement", "sub_class": "Homestead", ...}
-  If no data exists, 3 demo datasets are generated on first start.
-  Government map lookups are available through the server-side /api/bd/* proxy.
-  The proxy obtains a fresh CSRF token automatically; set BD_MAP_URL to override
-  the upstream service URL.
+TWO ISOLATED DATA MODES (header switch, X-Data-Mode sent by the front-end)
+    dataset : data/<district>_<sheet>_land.json / _plot.json  (+ legacy land.json / plot.json)
+              If nothing exists, 3 demo datasets are generated on first start.
+    api     : data/api/api_<div>_<dist>_<thana>_<mouza>_{plot,land,meta}.json
+              Areas are fetched step by step from the government map service through the
+              /api/bd/* proxy, then SAVED under a dynamic id. After that every feature
+              (map, plot drawer, search, verify, tracking, fraud, workflow, admin) works on
+              them exactly like on dataset mode. If no API area is saved yet, API mode falls
+              back to the demo data (and says so).
+    Each mode has its own caches, case ids (MUT-… / API-…) and admin views.
+
+    Government service URL can be overridden with BD_MAP_URL.
 
 Roles (MVP, no login):  User = public pages.  Admin = switch in the header -> #/admin
 Ownership, cases, fraud alerts and mutation workflow are DUMMY data (deterministic).
@@ -35,11 +37,13 @@ import webbrowser
 import zlib
 from datetime import date, timedelta
 
-from flask import Flask, Response, jsonify, redirect, request
+from flask import Flask, Response, jsonify, redirect, request, has_request_context
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE, "data")
+API_DIR = os.path.join(DATA_DIR, "api")
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(API_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 TODAY = date.today()
@@ -65,39 +69,53 @@ def bn_digits(s):
     return "".join(BN_DIGITS[int(c)] if c.isdigit() else c for c in str(s))
 
 
+def cur_mode():
+    """'api' or 'dataset' — taken from the request (X-Data-Mode header or ?mode=)."""
+    if not has_request_context():
+        return "dataset"
+    m = request.headers.get("X-Data-Mode") or request.args.get("mode") or ""
+    return "api" if m == "api" else "dataset"
+
+
+# ----------------------------------------------------------------- government map service proxy
+def _bd_open():
+    try:
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+        page = opener.open(BD_MAP_URL + "/", timeout=15).read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(f"Government map service unreachable: {exc}") from exc
+    match = re.search(r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)', page, re.I)
+    if not match:
+        raise RuntimeError("Government map service did not provide a CSRF token")
+    _bd_session.update(token=match.group(1), cookies=opener)
+
+
 def _bd_request(path, fields):
-    """POST to the government map service using a fresh Laravel CSRF session."""
+    """POST to the government map service using a fresh Laravel CSRF session (one automatic retry on 419)."""
     with _bd_lock:
-        if not _bd_session["token"] or not _bd_session["cookies"]:
-            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
-            page = opener.open(BD_MAP_URL + "/", timeout=15).read().decode("utf-8", "replace")
-            match = re.search(r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)', page, re.I)
-            if not match:
-                raise RuntimeError("Government map service did not provide a CSRF token")
-            _bd_session["token"] = match.group(1)
-            _bd_session["cookies"] = opener
-        opener = _bd_session["cookies"]
-        data = dict(fields)
-        data["_token"] = _bd_session["token"]
-        req = urllib.request.Request(
-            BD_MAP_URL + path,
-            data=urllib.parse.urlencode(data).encode("utf-8"),
-            headers={
-                "Accept": "application/json",
-                "X-CSRF-TOKEN": _bd_session["token"],
-                "X-Requested-With": "XMLHttpRequest",
-            },
-            method="POST",
-        )
-        try:
-            with opener.open(req, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if exc.code == 419:
-                _bd_session.update(token=None, cookies=None)
-            raise RuntimeError(f"Government map service returned HTTP {exc.code}") from exc
-        except (urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Government map service request failed: {exc}") from exc
+        for attempt in (0, 1):
+            if not _bd_session["token"] or not _bd_session["cookies"]:
+                _bd_open()
+            opener, token = _bd_session["cookies"], _bd_session["token"]
+            data = dict(fields)
+            data["_token"] = token
+            req = urllib.request.Request(
+                BD_MAP_URL + path,
+                data=urllib.parse.urlencode(data).encode("utf-8"),
+                headers={"Accept": "application/json", "X-CSRF-TOKEN": token, "X-Requested-With": "XMLHttpRequest"},
+                method="POST",
+            )
+            try:
+                with opener.open(req, timeout=60) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code in (419, 401, 403):
+                    _bd_session.update(token=None, cookies=None)
+                    if attempt == 0:
+                        continue
+                raise RuntimeError(f"Government map service returned HTTP {exc.code}") from exc
+            except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+                raise RuntimeError(f"Government map service request failed: {exc}") from exc
 
 
 # ----------------------------------------------------------------- WKT -> GeoJSON
@@ -145,14 +163,63 @@ def centroid_of(g):
     return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
 
 
-# ----------------------------------------------------------------- dataset discovery / loading
+def _pt_in_ring(x, y, ring):
+    inside, j = False, len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi, xj, yj = ring[i][0], ring[i][1], ring[j][0], ring[j][1]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-18) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _outer_rings(g):
+    if g["type"] == "MultiPolygon":
+        return [p[0] for p in g["coordinates"] if p]
+    return [g["coordinates"][0]] if g["coordinates"] else []
+
+
+def assign_parts(plots, lands):
+    """Land-use rows without a plot number get the plot that contains their centroid."""
+    if not plots or not lands or len(plots) * len(lands) > 6_000_000:
+        return
+    boxes = []
+    for p in plots:
+        g = parse_wkt(p.get("geom"))
+        if not g:
+            continue
+        rings = _outer_rings(g)
+        pts = [q for r in rings for q in r]
+        if pts:
+            xs, ys = [q[0] for q in pts], [q[1] for q in pts]
+            boxes.append((min(xs), min(ys), max(xs), max(ys), rings, p["plot_no_en"]))
+    for l in lands:
+        if l.get("plot_no_en"):
+            continue
+        g = parse_wkt(l.get("geom"))
+        if not g:
+            continue
+        try:
+            cx, cy = centroid_of(g)
+        except ZeroDivisionError:
+            continue
+        for x0, y0, x1, y1, rings, no in boxes:
+            if x0 <= cx <= x1 and y0 <= cy <= y1 and any(_pt_in_ring(cx, cy, r) for r in rings):
+                l["plot_no_en"] = no
+                l.setdefault("label", bn_digits(no))
+                break
+
+
+# ----------------------------------------------------------------- dataset discovery / loading (mode aware)
 NAME_RE = re.compile(r"^(?P<id>[A-Za-z0-9][A-Za-z0-9_\-]*)_(?P<kind>land|plot)\.json$", re.I)
 SPLIT_RE = re.compile(r"^(?P<d>.+?)[_-](?P<s>\d+)$")
 
 
-def discover():
+def _scan(folders):
     found = {}
-    for folder in (DATA_DIR, BASE):
+    for folder in folders:
+        if not os.path.isdir(folder):
+            continue
         for fn in sorted(os.listdir(folder)):
             m = NAME_RE.match(fn)
             if m:
@@ -162,9 +229,40 @@ def discover():
     return found
 
 
+def discover():
+    if cur_mode() == "api":
+        found = _scan([API_DIR])
+        if found:
+            return found  # nothing saved yet -> fall back to demo data below
+    return _scan([DATA_DIR, BASE])
+
+
+_meta = {}
+
+
+def api_meta(ds):
+    p = os.path.join(API_DIR, f"{ds}_meta.json")
+    try:
+        mt = os.path.getmtime(p)
+        c = _meta.get(p)
+        if c and c[0] == mt:
+            return c[1]
+        with open(p, encoding="utf-8") as f:
+            m = json.load(f)
+        _meta[p] = (mt, m)
+        return m
+    except (OSError, ValueError):
+        return None
+
+
 def label_of(ds):
-    m = SPLIT_RE.match(ds)
-    d, s = (m["d"], m["s"]) if m else (ds, "")
+    m = api_meta(ds)
+    if m:
+        bn = m.get("district_bn") or m.get("district_en") or ""
+        en = m.get("district_en") or m.get("district_bn") or ""
+        return "api" + str(m.get("district", "")), str(m.get("mouza_code") or m.get("mouza", "")), bn, en
+    mm = SPLIT_RE.match(ds)
+    d, s = (mm["d"], mm["s"]) if mm else (ds, "")
     en = d.replace("_", " ").replace("-", " ").title()
     return d.lower(), s, BN_DIST.get(d.lower().replace("-", "_"), en), en
 
@@ -201,21 +299,28 @@ def fc_of(feats):
 
 
 def signature():
-    parts = []
+    parts = [cur_mode()]
     for ds, files in sorted(discover().items()):
         for k, p in sorted(files.items()):
-            st = os.stat(p)
-            parts.append(f"{ds}{k}{st.st_mtime_ns}{st.st_size}")
+            try:
+                st = os.stat(p)
+                parts.append(f"{ds}{k}{st.st_mtime_ns}{st.st_size}")
+            except OSError:
+                pass
+        mp = os.path.join(API_DIR, f"{ds}_meta.json")
+        if os.path.exists(mp):
+            parts.append(f"{ds}meta{os.stat(mp).st_mtime_ns}")
     return hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
 
 
-_sum = {"sig": None, "list": []}
+_sum = {}
 
 
 def summaries():
-    sig = signature()
-    if _sum["sig"] == sig:
-        return _sum["list"]
+    mode, sig = cur_mode(), signature()
+    c = _sum.get(mode)
+    if c and c[0] == sig:
+        return c[1]
     out = []
     for ds, files in sorted(discover().items()):
         try:
@@ -231,24 +336,28 @@ def summaries():
             bb = [min(lats), min(lngs), max(lats), max(lngs)]
             center = [(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2]
         d, s, bn, en = label_of(ds)
+        m = api_meta(ds) or {}
         out.append({
             "id": ds, "district": d, "sheet": s, "district_bn": bn, "district_en": en,
             "plots": len(plot), "parts": len(land),
             "area_sqm": round(sum(f["properties"]["area_sqm"] for f in (plot or land)), 1),
             "bbox": bb, "center": center,
+            "source": "api" if m else "demo", "fallback": mode == "api" and not m,
+            "mouza_bn": m.get("mouza_bn"), "mouza_en": m.get("mouza_en"),
         })
-    _sum.update(sig=sig, list=out)
+    _sum[mode] = (sig, out)
     return out
 
 
 # ----------------------------------------------------------------- plot index + dummy records
-_idx = {"sig": None, "plots": {}, "parts": {}}
+_idx = {}
 
 
 def index():
-    sig = signature()
-    if _idx["sig"] == sig:
-        return _idx
+    mode, sig = cur_mode(), signature()
+    c = _idx.get(mode)
+    if c and c["sig"] == sig:
+        return c
     plots, parts = {}, {}
     for ds, files in sorted(discover().items()):
         try:
@@ -256,8 +365,8 @@ def index():
                 for i, f in enumerate(load_file(files["plot"], ds)["features"]):
                     p = f["properties"]
                     no = str(p.get("plot_no_en", p.get("label", i)))
-                    c = centroid_of(f["geometry"])
-                    plots[(ds, no)] = {"ds": ds, "idx": i, "props": p, "geom": f["geometry"], "lat": c[1], "lng": c[0]}
+                    c2 = centroid_of(f["geometry"])
+                    plots[(ds, no)] = {"ds": ds, "idx": i, "props": p, "geom": f["geometry"], "lat": c2[1], "lng": c2[0]}
             if "land" in files:
                 for f in load_file(files["land"], ds)["features"]:
                     p = f["properties"]
@@ -265,8 +374,8 @@ def index():
                         {"maj": p.get("maj_class"), "sub": p.get("sub_class"), "area_sqm": p["area_sqm"]})
         except Exception:
             continue
-    _idx.update(sig=sig, plots=plots, parts=parts)
-    return _idx
+    _idx[mode] = {"sig": sig, "plots": plots, "parts": parts}
+    return _idx[mode]
 
 
 NAMES = [("আব্দুর রহিম", "Abdur Rahim"), ("মোহাম্মদ কামাল", "Mohammad Kamal"), ("রহিমা বেগম", "Rahima Begum"),
@@ -334,13 +443,14 @@ def alert_evidence(typ, rng, area_dec):
             _ev("নিবন্ধনের পর নামজারির আবেদন করা হয়নি", "No mutation application filed after registration")]
 
 
-_der = {"sig": None}
+_der = {}
 
 
 def derived():
-    idx = index()
-    if _der["sig"] == idx["sig"]:
-        return _der
+    idx, mode = index(), cur_mode()
+    c = _der.get(mode)
+    if c and c["sig"] == idx["sig"]:
+        return c
     alerts, by_plot = {}, {}
     for key, pl in idx["plots"].items():
         scen = scenario(pl["ds"], pl["idx"])
@@ -360,6 +470,7 @@ def derived():
         alerts[aid] = a
         by_plot.setdefault(key, []).append(a)
     cases, n = {}, 0
+    prefix = "API" if mode == "api" else "MUT"
     for key, pl in idx["plots"].items():
         if pl["idx"] % 2 or n >= 60:
             continue
@@ -380,7 +491,11 @@ def derived():
             tl.append({"date": d0.isoformat(), "key": STAGES[s_i]})
             d0 = min(TODAY, d0 + timedelta(days=rng.randint(2, 6)))
         d, s, bn, en = label_of(ds)
-        cid = f"MUT-{TODAY.year}-{n:05d}"
+        h = zlib.crc32(f"case:{ds}:{no}".encode()) % 90000 + 10000
+        cid = f"{prefix}-{TODAY.year}-{h:05d}"
+        while cid in cases:  # keep ids stable per plot, resolve rare collisions
+            h += 1
+            cid = f"{prefix}-{TODAY.year}-{h:05d}"
         cases[cid] = {
             "id": cid, "ds": ds, "plot_no": no, "label": pl["props"].get("label", no), "sheet": s,
             "district": {"bn": bn, "en": en}, "buyer": person(rng), "seller": person(rng),
@@ -390,8 +505,8 @@ def derived():
             "stage": stage, "status": status, "timeline": tl,
             "checks": [{"key": k, "level": v if stage >= 1 else "queued"} for k, v in checks],
         }
-    _der.update(sig=idx["sig"], alerts=alerts, cases=cases, by_plot=by_plot)
-    return _der
+    _der[mode] = {"sig": idx["sig"], "alerts": alerts, "cases": cases, "by_plot": by_plot}
+    return _der[mode]
 
 
 def wf_checks(scen, ft):
@@ -426,7 +541,7 @@ def record(key):
     ds, no = key
     p = pl["props"]
     rng = random.Random(f"{ds}:{no}")
-    owner = person(rng)  # first draw: owner_of() relies on it
+    owner = person(rng)  # first draw: api_search relies on it
     father = person(rng)
     scen = scenario(ds, pl["idx"])
     d, s, bn, en = label_of(ds)
@@ -479,7 +594,8 @@ def record(key):
         "checks": [{"key": k, "level": v} for k, v in checks], "score": score,
         "verdict": "safe" if score < 25 else "caution" if score < 55 else "danger",
         "advice": [{"bn": a[0], "en": a[1]} for a in advice],
-        "parts": index()["parts"].get(key, []), "geometry": pl["geom"], "center": [pl["lat"], pl["lng"]],
+        "parts": index()["parts"].get((ds, no), []), "geometry": pl["geom"], "center": [pl["lat"], pl["lng"]],
+        "source": "api" if api_meta(ds) else "demo",
     }
 
 
@@ -493,13 +609,14 @@ def api_datasets():
     return jsonify(summaries())
 
 
+def _num(*vals):
+    return all(re.fullmatch(r"\d+", v or "") for v in vals)
+
+
 @app.route("/api/bd/divisions")
 def api_bd_divisions():
     try:
-        return jsonify(_bd_request("/getAdminByCode", {
-            "level": "forDiv",
-            "column": "division_n",
-        }))
+        return jsonify(_bd_request("/getAdminByCode", {"level": "forDiv", "column": "division_n"}))
     except RuntimeError as exc:
         return err(str(exc), 502)
 
@@ -507,13 +624,10 @@ def api_bd_divisions():
 @app.route("/api/bd/districts")
 def api_bd_districts():
     division = request.args.get("division_code", "").strip()
-    if not re.fullmatch(r"\d+", division):
+    if not _num(division):
         return err("division_code must be numeric")
     try:
-        return jsonify(_bd_request("/getAdminByCode", {
-            "level": "forDist",
-            "division_code": division,
-        }))
+        return jsonify(_bd_request("/getAdminByCode", {"level": "forDist", "division_code": division}))
     except RuntimeError as exc:
         return err(str(exc), 502)
 
@@ -521,31 +635,22 @@ def api_bd_districts():
 @app.route("/api/bd/thanas")
 def api_bd_thanas():
     division, district = (request.args.get(k, "").strip() for k in ("division_code", "district_code"))
-    if not re.fullmatch(r"\d+", division) or not re.fullmatch(r"\d+", district):
+    if not _num(division, district):
         return err("division_code and district_code must be numeric")
     try:
-        return jsonify(_bd_request("/getAdminByCode", {
-            "level": "forThana",
-            "division_code": division,
-            "district_code": district,
-        }))
+        return jsonify(_bd_request("/getAdminByCode", {"level": "forThana", "division_code": division, "district_code": district}))
     except RuntimeError as exc:
         return err(str(exc), 502)
 
 
 @app.route("/api/bd/mouzas")
 def api_bd_mouzas():
-    division, district, thana = (request.args.get(k, "").strip()
-                                 for k in ("division_code", "district_code", "thana_code"))
-    if not all(re.fullmatch(r"\d+", value) for value in (division, district, thana)):
+    division, district, thana = (request.args.get(k, "").strip() for k in ("division_code", "district_code", "thana_code"))
+    if not _num(division, district, thana):
         return err("division_code, district_code and thana_code must be numeric")
     try:
         return jsonify(_bd_request("/getAdminByCode", {
-            "level": "forMauza",
-            "division_code": division,
-            "district_code": district,
-            "thana_code": thana,
-        }))
+            "level": "forMauza", "division_code": division, "district_code": district, "thana_code": thana}))
     except RuntimeError as exc:
         return err(str(exc), 502)
 
@@ -571,6 +676,65 @@ def api_bd_map_data():
         return err(str(exc), 502)
 
 
+def _norm_rows(rows, meta, is_plot):
+    out = []
+    for i, r in enumerate(rows or []):
+        if not isinstance(r, dict) or not r.get("geom"):
+            continue
+        r = dict(r)
+        no = r.get("plot_no_en") or r.get("plot_no") or (r.get("label") if is_plot else None)
+        if no is None and is_plot:
+            no = i + 1
+        if no is not None and str(no) != "":
+            r["plot_no_en"] = str(no)
+            r.setdefault("label", bn_digits(no))
+        if is_plot:
+            r.setdefault("mouza", meta.get("mouza_bn") or meta.get("mouza_en") or "")
+        r.setdefault("m_code", meta.get("mouza_code", ""))
+        out.append(r)
+    return out
+
+
+@app.route("/api/bd/register", methods=["POST"])
+def api_bd_register():
+    """Save a government-API area under a dynamic id so every feature can use it like a dataset."""
+    b = request.get_json(silent=True) or {}
+    meta = b.get("meta") or {}
+    codes = [re.sub(r"[^A-Za-z0-9]", "", str(meta.get(k, ""))) for k in ("division", "district", "thana", "mouza")]
+    if not all(codes):
+        return err("division, district, thana and mouza are required")
+    ds = ("api_" + "_".join(codes)).lower()
+    plots, lands = _norm_rows(b.get("plot"), meta, True), _norm_rows(b.get("land"), meta, False)
+    if not plots:
+        return err("no plot geometry returned by the government service / সরকারি সার্ভিস থেকে দাগ পাওয়া যায়নি", 422)
+    assign_parts(plots, lands)
+    keep = {k: ("" if v is None else str(v)[:200]) for k, v in meta.items()}
+    keep["boundaries"] = {k: v for k, v in (b.get("boundaries") or {}).items()
+                          if k in ("district", "thana") and isinstance(v, str)}
+    keep["saved"] = TODAY.isoformat()
+
+    def dump(name, obj):
+        with open(os.path.join(API_DIR, name), "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+    dump(f"{ds}_meta.json", keep)
+    dump(f"{ds}_plot.json", {"plots": plots})
+    dump(f"{ds}_land.json", {"landuse": lands})
+    return jsonify(ok=True, id=ds, plots=len(plots), parts=len(lands))
+
+
+@app.route("/api/admin/dataset/<ds>", methods=["DELETE"])
+def api_admin_dataset_delete(ds):
+    ds = ds.lower()
+    if not re.fullmatch(r"api_[a-z0-9_]+", ds) or not api_meta(ds):
+        return err("only saved API areas can be removed", 404)
+    for k in ("plot", "land", "meta"):
+        try:
+            os.remove(os.path.join(API_DIR, f"{ds}_{k}.json"))
+        except OSError:
+            pass
+    return jsonify(ok=True)
+
+
 @app.route("/api/version")
 def api_version():
     return jsonify(sig=signature())
@@ -594,7 +758,8 @@ def api_data():
                 land += load_file(files[i]["land"], i)["features"]
             if "plot" in files[i]:
                 plot += load_file(files[i]["plot"], i)["features"]
-        return jsonify(land=fc_of(land), plot=fc_of(plot), ids=ids, sig=signature())
+        bounds = [{"ds": i, **((api_meta(i) or {}).get("boundaries") or {})} for i in ids if api_meta(i)]
+        return jsonify(land=fc_of(land), plot=fc_of(plot), ids=ids, bounds=bounds, sig=signature())
     except Exception as e:
         return err(str(e), 500)
 
@@ -615,7 +780,7 @@ def api_search():
         p = pl["props"]
         no = key[1].lower()
         owner = person(random.Random(f"{key[0]}:{key[1]}"))
-        hay = f"{no} {p.get('label', '')} {p.get('m_code', '')} {owner['bn']} {owner['en']}".lower()
+        hay = f"{no} {p.get('label', '')} {p.get('m_code', '')} {p.get('mouza', '')} {owner['bn']} {owner['en']}".lower()
         if q in hay:
             d, s, bn, en = label_of(key[0])
             res.append({"ds": key[0], "plot_no": key[1], "label": p.get("label", key[1]), "sheet": s,
@@ -695,6 +860,8 @@ def api_admin_wf_set(cid):
 
 @app.route("/api/admin/upload/<ds>/<kind>", methods=["POST"])
 def api_admin_upload(ds, kind):
+    if cur_mode() == "api":
+        return err("upload is for dataset mode; use the API loader / আপলোড শুধু ডেটাসেট মোডে")
     ds = ds.lower()
     if kind not in ("land", "plot") or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,60}", ds):
         return err("name must look like gazipur_001 / নাম হতে হবে gazipur_001 এর মতো")
@@ -725,7 +892,7 @@ CLASSES = [("Settlement", "Homestead"), ("Agriculture", "Paddy Field"), ("Commer
 
 
 def write_demo():
-    if discover():
+    if _scan([DATA_DIR, BASE]):
         return
     for ds, lat, lng, mouza in DEMO:
         rng = random.Random(ds)
@@ -808,6 +975,7 @@ h1,h2,h3,h4{margin:0;line-height:1.25}
 .btnrow{display:flex;gap:8px;flex-wrap:wrap}
 input,select{font:inherit;color:var(--tx);background:var(--sf2);border:1px solid var(--ln);border-radius:11px;padding:10px 12px;width:100%;outline:none;min-width:0}
 input:focus,select:focus{border-color:var(--g2);box-shadow:0 0 0 3px color-mix(in srgb,var(--g2) 22%,transparent)}
+select:disabled{opacity:.6}
 label.f{display:block;font-size:13px;color:var(--mu);font-weight:500}label.f>*:last-child{margin-top:5px}
 .card{background:var(--sf);border:1px solid var(--ln);border-radius:18px;padding:20px;box-shadow:var(--sh)}
 .badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;font-weight:600;background:var(--sf2);color:var(--mu);white-space:nowrap}
@@ -844,7 +1012,7 @@ label.f{display:block;font-size:13px;color:var(--mu);font-weight:500}label.f>*:l
 .step{display:flex;gap:14px}.step .n{width:40px;height:40px;border-radius:50%;background:var(--g);color:var(--on);display:grid;place-items:center;font-weight:700;flex:none}
 .step h4{margin-bottom:3px}.step p{margin:0;color:var(--mu);font-size:14.5px}
 footer{border-top:1px solid var(--ln);padding:26px 0;color:var(--mu);font-size:14px;text-align:center}
-.note{background:var(--wrt);color:var(--wr);border-radius:12px;padding:10px 14px;font-size:13.5px}
+.note{background:var(--wrt);color:var(--wr);border-radius:12px;padding:10px 14px;font-size:13.5px;display:inline-block}
 /* page heads */
 .phead{padding:30px 0 18px}.phead h1{font-size:30px}.phead p{color:var(--mu);margin:6px 0 0}
 .formrow{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;align-items:end}
@@ -926,6 +1094,13 @@ dialog::backdrop{background:rgba(0,0,0,.55)}.dhead{display:flex;justify-content:
 .ovpin b{display:block;font-size:13px}.ovpin:after{content:'';position:absolute;left:50%;bottom:-6px;margin-left:-6px;border:6px solid transparent;border-bottom:0;border-top-color:var(--g)}
 #toast{position:fixed;z-index:5000;right:16px;bottom:18px;background:#0b1f15;color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;display:none;max-width:90vw;box-shadow:var(--sh)}
 body.map-mode footer{display:none}
+/* api loader popup */
+#loader{position:fixed;inset:0;z-index:6000;background:rgba(0,0,0,.55);display:grid;place-items:center}
+#loader .card{width:min(420px,92vw)}.pbar{height:8px;background:var(--sf2);border-radius:6px;overflow:hidden;margin:12px 0}
+.pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--g),var(--g2));transition:width .3s}
+#ldSteps{list-style:none;margin:0 0 12px;padding:0}#ldSteps li{padding:5px 0;color:var(--mu)}#ldSteps li:before{content:'○ '}
+#ldSteps li.run{color:var(--tx);font-weight:600}#ldSteps li.run:before{content:'⏳ '}
+#ldSteps li.ok:before{content:'✓ ';color:var(--g)}#ldSteps li.warn:before{content:'! ';color:var(--wr)}#ldSteps li.fail:before{content:'✕ ';color:var(--bd)}
 @media(max-width:960px){.hero-in{grid-template-columns:1fr}.hero-art{display:none}.stats{grid-template-columns:repeat(3,1fr)}.grid4{grid-template-columns:repeat(2,1fr)}.grid3{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(3,1fr)}.formrow{grid-template-columns:1fr 1fr}}
 @media(max-width:760px){.burger{display:block}.nav-links{display:none;position:absolute;top:var(--nav);left:0;right:0;background:var(--sf);border-bottom:1px solid var(--ln);flex-direction:column;align-items:stretch;padding:10px;margin:0}
 .nav-links.open{display:flex}#roleSeg{margin:6px 0 0;align-self:flex-start}.brand span:last-child{font-size:17px}
@@ -971,11 +1146,12 @@ body.map-mode footer{display:none}
         <div id="apiSearch" hidden>
           <div class="row3 api-fields">
             <label class="f"><span data-i18n="f_division"></span><select id="h_division"></select></label>
-            <label class="f"><span data-i18n="f_district"></span><select id="h_api_dist"></select></label>
+            <label class="f"><span data-i18n="f_district"></span><select id="h_adist"></select></label>
             <label class="f"><span data-i18n="f_thana"></span><select id="h_thana"></select></label>
           </div>
-          <div class="row3 api-fields">
+          <div class="row2 api-fields">
             <label class="f"><span data-i18n="f_mouza"></span><select id="h_mouza"></select></label>
+            <label class="f"><span data-i18n="f_plot"></span><input id="h_aplot"></label>
           </div>
         </div>
         <div class="btnrow"><button class="btn" id="h_map" data-i18n="btn_map"></button><button class="btn alt" id="h_ver" data-i18n="btn_verify"></button></div>
@@ -1013,7 +1189,14 @@ body.map-mode footer{display:none}
     <div class="ph"><b data-i18n="nav_map"></b><small id="sub"></small></div>
     <div class="pb">
       <h4 data-i18n="m_nav"></h4>
-      <div class="row2"><select id="m_dist"></select><select id="m_sheet"></select></div>
+      <div id="m_dsNav"><div class="row2"><select id="m_dist"></select><select id="m_sheet"></select></div></div>
+      <div id="m_apiNav" hidden>
+        <select id="m_division"></select><select id="m_adist" style="margin-top:6px"></select>
+        <select id="m_thana" style="margin-top:6px"></select><select id="m_mouza" style="margin-top:6px"></select>
+        <button class="btn sm" id="m_apiload" style="margin:8px 0;width:100%" data-i18n="api_load"></button>
+        <h4 data-i18n="api_saved"></h4><div id="m_saved" class="plist"></div>
+        <div id="m_fb" class="note" hidden data-i18n="api_fb"></div>
+      </div>
       <div class="btnrow" style="margin-top:8px"><button class="btn sm alt" id="m_all" data-i18n="m_overview"></button><button class="btn sm alt" id="fit" data-i18n="m_fit"></button></div>
       <h4 data-i18n="m_search"></h4>
       <input id="q" type="search" data-ph="m_search_ph"><input id="place" type="search" data-ph="m_place_ph">
@@ -1043,6 +1226,7 @@ body.map-mode footer{display:none}
     <label class="f"><span data-i18n="f_sheet"></span><select id="v_sheet"></select></label>
     <label class="f"><span data-i18n="f_plot"></span><input id="v_plot" list="v_plots"></label>
     <button class="btn" id="v_go" data-i18n="v_btn"></button></div><datalist id="v_plots"></datalist></div>
+  <div class="card" id="v_apiBox" hidden style="margin-top:12px"></div>
   <div id="v_out"></div><p style="margin:26px 0"><span class="note" data-i18n="demo_note"></span></p>
 </div></section>
 
@@ -1055,12 +1239,13 @@ body.map-mode footer{display:none}
 
 <section class="view" id="v-admin" hidden><div class="container" id="a_root"></div></section>
 </main>
+<div id="loader" hidden><div class="card"><h3 id="ldTitle"></h3><div class="pbar"><i id="ldBar"></i></div><ul id="ldSteps"></ul><button class="btn sm alt" id="ldClose" hidden data-i18n="close"></button></div></div>
 <div id="toast"></div><dialog id="dlg"></dialog>
 
 <script>
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const BN='০১২৩৪৫৬৭৮৯';
-let lang=localStorage.lang||'bn',role=localStorage.role||'user',dataMode=localStorage.dataMode||'dataset';
+let lang=localStorage.lang||'bn',role=localStorage.role||'user',dataMode=localStorage.dataMode==='api'?'api':'dataset';
 /* ---------- translations [bn, en] ---------- */
 const T={
 brand:["ভূমি দর্পণ","Bhumi Dorpon"],tagline:["বাংলাদেশ ভূমি তথ্য ও যাচাই","Bangladesh land info & verification"],
@@ -1123,7 +1308,7 @@ sg_registration:["দলিল নিবন্ধন","Deed registered"],sg_auto
 ev_hold:["ম্যানুয়ালি আটকানো হয়েছে","Put on hold manually"],ev_release:["অ্যাডমিন ছাড় দিয়েছে","Released by admin"],ev_reject:["প্রত্যাখ্যান করা হয়েছে","Rejected"],
 cs_ok:["চলমান","On track"],cs_flagged:["আটকানো (সতর্কতা)","On hold (flagged)"],cs_delayed:["বিলম্বিত","Delayed"],cs_completed:["সম্পন্ন","Completed"],cs_rejected:["প্রত্যাখ্যাত","Rejected"],
 tr_title:["নামজারি কেস ট্র্যাকিং","Mutation case tracking"],tr_sub:["দলিল নিবন্ধন থেকে খতিয়ান প্রাপ্তি পর্যন্ত আপনার কেসের বর্তমান অবস্থা দেখুন।","Follow your case from deed registration to khatian."],
-tr_ph:["কেস নম্বর (যেমন MUT-2026-00001)","Case no. (e.g. MUT-2026-00001)"],tr_btn:["অনুসন্ধান","Track"],tr_samples:["নমুনা কেস","Sample cases"],tr_notfound:["এই নম্বরে কোনো কেস পাওয়া যায়নি","No case found for this number"],
+tr_ph:["কেস নম্বর (যেমন MUT-2026-12345)","Case no. (e.g. MUT-2026-12345)"],tr_btn:["অনুসন্ধান","Track"],tr_samples:["নমুনা কেস","Sample cases"],tr_notfound:["এই নম্বরে কোনো কেস পাওয়া যায়নি","No case found for this number"],
 tr_buyer:["ক্রেতা/আবেদনকারী","Buyer / applicant"],tr_seller:["বিক্রেতা","Seller"],tr_deed:["দলিল নং","Deed no."],tr_office:["সাব-রেজিস্ট্রি অফিস","Sub-registry office"],tr_sla:["নির্ধারিত সময়সীমা","Service deadline"],tr_left:["দিন বাকি","days left"],tr_over:["দিন অতিক্রান্ত","days overdue"],tr_timeline:["ঘটনাপ্রবাহ","Timeline"],tr_checks:["স্বয়ংক্রিয় যাচাই","Automated checks"],tr_plot:["দাগ","Plot"],
 a_title:["অ্যাডমিন টুলস","Admin tools"],a_note:["MVP: লগইন নেই — অ্যাডমিন টুল সবার জন্য উন্মুক্ত (শুধু ডেমো)","MVP: no login — admin tools are open (demo only)"],
 a_overview:["সারসংক্ষেপ","Overview"],a_fraud:["জালিয়াতি সতর্কতা","Fraud alerts"],a_workflow:["ই-নামজারি ওয়ার্কফ্লো","e-Mutation workflow"],a_data:["ডেটা ম্যানেজার","Data manager"],
@@ -1133,7 +1318,8 @@ th_id:["আইডি","ID"],th_type:["ধরন","Type"],th_sev:["তীব্�
 a_evidence:["প্রমাণ / সংকেত","Evidence / signals"],a_advance:["পরবর্তী ধাপে","Advance"],a_hold:["আটকান","Hold"],a_release:["ছাড় দিন","Release"],a_reject:["প্রত্যাখ্যান","Reject"],a_updated:["হালনাগাদ হয়েছে","Updated"],
 a_upload_h:["নতুন ডেটাসেট আপলোড","Upload dataset"],a_upload_help:["নাম দিন জেলা_শিট আকারে (যেমন gazipur_002), তারপর land ও plot JSON বেছে নিন। ফাইল data/ ফোল্ডারে জমা হবে এবং মানচিত্রে স্বয়ংক্রিয় যোগ হবে।","Name it district_sheet (e.g. gazipur_002), then choose land and plot JSON. Files are saved in data/ and appear on the map automatically."],
 a_name:["ডেটাসেটের নাম","Dataset name"],a_land_f:["land.json ফাইল","land.json file"],a_plot_f:["plot.json ফাইল","plot.json file"],a_upload_btn:["আপলোড","Upload"],a_uploaded:["আপলোড সম্পন্ন","Uploaded"],a_pick:["অন্তত একটি ফাইল বেছে নিন","Choose at least one file"],
-a_gate_t:["অ্যাডমিন মোড বন্ধ আছে","Admin mode is off"],a_gate_d:["অ্যাডমিন টুল দেখতে ওপরের সুইচ থেকে অ্যাডমিন বেছে নিন। (MVP-তে লগইন নেই)","Switch to Admin using the toggle above to see admin tools. (No login in the MVP)"],a_enable:["অ্যাডমিন মোড চালু করুন","Enable admin mode"]
+a_gate_t:["অ্যাডমিন মোড বন্ধ আছে","Admin mode is off"],a_gate_d:["অ্যাডমিন টুল দেখতে ওপরের সুইচ থেকে অ্যাডমিন বেছে নিন। (MVP-তে লগইন নেই)","Switch to Admin using the toggle above to see admin tools. (No login in the MVP)"],a_enable:["অ্যাডমিন মোড চালু করুন","Enable admin mode"],
+ld_title:["সরকারি API থেকে এলাকা লোড হচ্ছে","Loading area from government API"],ld_dist:["জেলার সীমানা","District boundary"],ld_thana:["থানার সীমানা","Thana boundary"],ld_plots:["দাগের ডেটা","Plot data"],ld_land:["ভূমি ব্যবহারের ডেটা","Land-use data"],ld_save:["সংরক্ষণ ও সূচক তৈরি","Saving & indexing"],ld_cached:["সংরক্ষিত এলাকা থেকে লোড হয়েছে","Loaded from saved area"],ld_nocode:["এই মৌজার ম্যাপ কোড নেই","This mouza has no map table code"],api_load:["API থেকে লোড করুন","Load from API"],api_saved:["সংরক্ষিত API এলাকা","Saved API areas"],api_fb:["API মোডে এখনো কোনো এলাকা লোড হয়নি — ডেমো ডেটা দেখানো হচ্ছে।","No API area loaded yet — showing demo data."],a_api_h:["সরকারি API থেকে এলাকা যোগ করুন","Add area from government API"],a_reload:["রিফ্রেশ","Refresh"],a_deleted:["মুছে ফেলা হয়েছে","Removed"],a_confirm:["এই সংরক্ষিত এলাকা মুছবেন?","Remove this saved area?"],th_src:["উৎস","Source"],src_api:["API","API"],src_demo:["ডেমো","Demo"]
 };
 const t=k=>(T[k]||[k,k])[lang==='bn'?0:1];
 const D=v=>String(v??'').replace(/\d/g,d=>lang==='bn'?BN[d]:d);
@@ -1148,40 +1334,97 @@ const key=s=>String(s||'').replace(/ /g,'_');
 const cls=c=>T['c_'+key(c)]?t('c_'+key(c)):(c||'—');
 const sub=c=>T['s_'+key(c)]?t('s_'+key(c)):(c||'—');
 const toast=m=>{const e=$('#toast');e.textContent=m;e.style.display='block';clearTimeout(toast.h);toast.h=setTimeout(()=>e.style.display='none',2800)};
-const api=async(u,o)=>{const r=await fetch(u,o);let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw Object.assign(new Error(j.error||r.status),{status:r.status});return j};
+/* every request carries the active data mode -> server keeps the two modes isolated */
+const api=async(u,o={})=>{o={...o,headers:{...(o.headers||{}),'X-Data-Mode':dataMode}};const r=await fetch(u,o);let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw Object.assign(new Error(j.error||r.status),{status:r.status});return j};
 const PALETTE={'Commercial Area':'#e63946','Settlement':'#f4a261','Agriculture':'#8ab17d','Water Body':'#38bdf8','Road':'#9ca3af','Industrial Area':'#8b5cf6','Forest':'#15803d','Vacant Land':'#d6c28a'};
 const colorOf=c=>PALETTE[c]||`hsl(${[...(c||'?')].reduce((a,ch)=>a*31+ch.charCodeAt(0)>>>0,7)%360} 65% 50%)`;
 const STAGES=['registration','auto_check','union_office','ac_land','approved','khatian'];
 const FT=['fake_deed','double_sale','rapid','mismatch'];
-let DSL=[],STATS={},VR=null,TC=null,cur={path:'/',q:new URLSearchParams()},BD={divisions:[],districts:[],thanas:[],mouzas:[]};
+let DSL=[],STATS={},VR=null,TC=null,cur={path:'/',q:new URLSearchParams()};
+const goto=h=>{if(location.hash===h)route(false);else location.hash=h};
 
 /* ---------- datasets / selectors ---------- */
 const districts=()=>{const m=new Map();DSL.forEach(d=>m.set(d.district,d));return[...m.values()]};
 const sheetsOf=d=>DSL.filter(x=>x.district===d);
+const shl=d=>d.source==='api'?((lang==='bn'?d.mouza_bn:d.mouza_en)||X(d.sheet||d.id)):t('f_sheet')+' '+X(d.sheet||d.id);
 function fillDist(el,val){el.innerHTML=`<option value="">${t('sel_district')}</option>`+districts().map(d=>`<option value="${esc(d.district)}">${esc(dn(d))}</option>`).join('');el.value=districts().some(d=>d.district===val)?val:''}
 function fillSheet(el,dist,val,all){const sh=sheetsOf(dist);
-  el.innerHTML=(all?`<option value="*">${t('all_sheets')}</option>`:`<option value="">${t('sel_sheet')}</option>`)+sh.map(d=>`<option value="${esc(d.id)}">${t('f_sheet')} ${X(d.sheet||d.id)}</option>`).join('');
+  el.innerHTML=(all?`<option value="*">${t('all_sheets')}</option>`:`<option value="">${t('sel_sheet')}</option>`)+sh.map(d=>`<option value="${esc(d.id)}">${shl(d)}</option>`).join('');
   el.value=[...el.options].some(o=>o.value===val)?val:(!all&&sh.length===1?sh[0].id:(all?'*':''))}
 function cascade(dEl,sEl,all,cb){const dv=dEl.value,sv=sEl.value;fillDist(dEl,dv);fillSheet(sEl,dEl.value,sv,all);
   dEl.onchange=()=>{fillSheet(sEl,dEl.value,'',all);cb&&cb('d')};sEl.onchange=()=>cb&&cb('s')}
 const fillPlots=(el,ds)=>{el.innerHTML='';if(ds&&ds!=='*')api('/api/plots/'+encodeURIComponent(ds)).then(a=>el.innerHTML=a.map(p=>`<option value="${esc(p.plot_no)}">${esc(p.label)}</option>`).join('')).catch(()=>{})};
 const bbOf=d=>[[d.bbox[0],d.bbox[1]],[d.bbox[2],d.bbox[3]]];
-const optionText=x=>lang==='bn'?(x.name_bn||x.name_en):(x.name_en||x.name_bn);
-const fillApiSelect=(el,items,placeholder)=>{el.innerHTML=`<option value="">${t(placeholder)}</option>`+items.map(x=>`<option value="${esc(x.code)}">${esc(optionText(x))}</option>`).join('')};
-async function loadApiDivisions(){if(!BD.divisions.length)BD.divisions=await api('/api/bd/divisions');fillApiSelect($('#h_division'),BD.divisions,'sel_division')}
-async function loadApiDistricts(code){BD.districts=await api('/api/bd/districts?division_code='+encodeURIComponent(code));fillApiSelect($('#h_api_dist'),BD.districts,'sel_district');$('#h_thana').innerHTML=`<option value="">${t('sel_thana')}</option>`;$('#h_mouza').innerHTML=`<option value="">${t('sel_mouza')}</option>`}
-async function loadApiThanas(division,code){BD.thanas=await api(`/api/bd/thanas?division_code=${encodeURIComponent(division)}&district_code=${encodeURIComponent(code)}`);fillApiSelect($('#h_thana'),BD.thanas,'sel_thana');$('#h_mouza').innerHTML=`<option value="">${t('sel_mouza')}</option>`}
-async function loadApiMouzas(division,district,code){BD.mouzas=await api(`/api/bd/mouzas?division_code=${encodeURIComponent(division)}&district_code=${encodeURIComponent(district)}&thana_code=${encodeURIComponent(code)}`);fillApiSelect($('#h_mouza'),BD.mouzas,'sel_mouza')}
-function setMode(mode){dataMode=mode;localStorage.dataMode=mode;$('#modeSeg button[data-mode="dataset"]').classList.toggle('on',mode==='dataset');$('#modeSeg button[data-mode="api"]').classList.toggle('on',mode==='api');$('#datasetSearch').hidden=mode!=='dataset';$('#apiSearch').hidden=mode!=='api';if(mode==='api')loadApiDivisions().catch(e=>toast(e.message))}
+
+/* ---------- government API cascading selects (division > district > thana > mouza) ---------- */
+const optionText=x=>lang==='bn'?(x.name_bn||x.name_en||x.name||''):(x.name_en||x.name_bn||x.name||'');
+const fillApiSelect=(el,items,ph)=>{el._items=items;el._ph=ph;el.innerHTML=`<option value="">${t(ph)}</option>`+items.map(x=>`<option value="${esc(x.code)}">${esc(optionText(x))}</option>`).join('')};
+const BDC={},sel=(p,n)=>$('#'+p+n);
+async function fillOpts(el,url,ph){
+  if(BDC[url])return fillApiSelect(el,BDC[url],ph);
+  el.disabled=true;el.innerHTML=`<option value="">${t('loading')}</option>`;let items=[];
+  try{items=await api(url);if(!Array.isArray(items))items=[];BDC[url]=items}catch(e){toast(e.message)}
+  fillApiSelect(el,items,ph);el.disabled=false}
+function bindApi(p){
+  const [dv,di,th,mz]=['division','adist','thana','mouza'].map(n=>sel(p,n));if(!dv||dv._bound)return;dv._bound=1;
+  const clr=(...els)=>els.forEach(e=>fillApiSelect(e,[],e===di?'sel_district':e===th?'sel_thana':'sel_mouza'));
+  dv.onchange=()=>{clr(di,th,mz);if(dv.value)fillOpts(di,'/api/bd/districts?division_code='+dv.value,'sel_district')};
+  di.onchange=()=>{clr(th,mz);if(di.value)fillOpts(th,`/api/bd/thanas?division_code=${dv.value}&district_code=${di.value}`,'sel_thana')};
+  th.onchange=()=>{clr(mz);if(th.value)fillOpts(mz,`/api/bd/mouzas?division_code=${dv.value}&district_code=${di.value}&thana_code=${th.value}`,'sel_mouza')};
+  fillOpts(dv,'/api/bd/divisions','sel_division');clr(di,th,mz)}
+const apiBoxHTML=p=>`<div class="row3 api-fields">${[['division','f_division'],['adist','f_district'],['thana','f_thana']].map(([n,k])=>`<label class="f"><span>${t(k)}</span><select id="${p}${n}"></select></label>`).join('')}</div><div class="row2 api-fields" style="align-items:end"><label class="f"><span>${t('f_mouza')}</span><select id="${p}mouza"></select></label><div class="btnrow"><button class="btn" id="${p}apiload">${t('api_load')}</button></div></div>`;
+function apiSel(p){const g=n=>sel(p,n),it=n=>(g(n)._items||[]).find(x=>String(x.code)===g(n).value)||{};
+  const [dv,di,th,mz]=['division','adist','thana','mouza'].map(it);
+  return{division:g('division').value,district:g('adist').value,thana:g('thana').value,mouza:g('mouza').value,mcode:mz.m_code,
+    meta:{division_bn:dv.name_bn,division_en:dv.name_en,district_bn:di.name_bn,district_en:di.name_en,thana_bn:th.name_bn,thana_en:th.name_en,mouza_bn:mz.name_bn,mouza_en:mz.name_en,mouza_code:mz.m_code}}}
+const apiId=s=>'api_'+[s.division,s.district,s.thana,s.mouza].map(c=>c.replace(/[^A-Za-z0-9]/g,'')).join('_').toLowerCase();
+
+/* ---------- loader popup (step by step) ---------- */
+function loaderOpen(steps){$('#ldTitle').textContent=t('ld_title');$('#ldSteps').innerHTML=steps.map(k=>`<li>${t(k)}</li>`).join('');$('#ldBar').style.width='0';$('#ldClose').hidden=true;$('#loader').hidden=false}
+function LD(i,st){$('#ldSteps').children[i].className=st;$('#ldBar').style.width=((i+(st==='run'?.4:1))/$('#ldSteps').children.length*100)+'%'}
+const loaderClose=()=>$('#loader').hidden=true;
+$('#ldClose').onclick=loaderClose;
+async function refreshData(){[DSL,STATS]=await Promise.all([api('/api/datasets'),api('/api/stats')]);sigSeen=(await api('/api/version')).sig}
+
+/* load one mouza from the government API, step by step, then SAVE it under a dynamic dataset id */
+async function loadApiArea(p,force){
+  const s=apiSel(p);
+  if(!s.division||!s.district||!s.thana||!s.mouza){toast(t('need_api_area'));return null}
+  if(!s.mcode){toast(t('ld_nocode'));return null}
+  const id=apiId(s);
+  if(!force&&DSL.some(d=>d.id===id&&d.source==='api')){toast(t('ld_cached'));return id}
+  loaderOpen(['ld_dist','ld_thana','ld_plots','ld_land','ld_save']);
+  const tbl=s.mcode.toLowerCase(),mz=`&mauzaVal=${encodeURIComponent(s.mouza)}`;
+  const q=(lvl,tb,x)=>api(`/api/bd/map-data?level=${lvl}&tableName=${encodeURIComponent(tb)}${x}`);
+  const run=async(i,fn,opt)=>{LD(i,'run');try{const r=await fn();LD(i,'ok');return r}catch(e){LD(i,opt?'warn':'fail');if(!opt)throw e}};
+  try{
+    const bd={};
+    bd.district=(await run(0,()=>q('forDist','gis_boundary_district',`&divVal=${s.division}&distVal=${s.district}`),1))?.geom;
+    bd.thana=(await run(1,()=>q('forThana','gis_boundary_upazila',`&thanaVal=${s.thana}`),1))?.geom;
+    const pr=await run(2,()=>q('forMauza',tbl,mz+'&plotOrLanduse=plot'));
+    const lr=await run(3,()=>q('forMauza',tbl,mz+'&plotOrLanduse=landuse'),1);
+    const r=await run(4,()=>api('/api/bd/register',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({meta:{division:s.division,district:s.district,thana:s.thana,mouza:s.mouza,...s.meta},plot:(pr&&pr.plots)||[],land:(lr&&lr.landuse)||[],boundaries:bd})}));
+    await refreshData();loaderClose();return r.id
+  }catch(e){$('#ldTitle').textContent=t('err')+': '+e.message;$('#ldClose').hidden=false;return null}}
+
+/* ---------- mode switch: fully isolated state ---------- */
+function applyModeUI(){$$('#modeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.mode===dataMode));$('#datasetSearch').hidden=dataMode==='api';$('#apiSearch').hidden=dataMode!=='api';if(dataMode==='api')bindApi('h_')}
+async function switchMode(m){dataMode=m;localStorage.dataMode=m;applyModeUI();
+  try{await refreshData()}catch(e){toast(e.message)}
+  loaded=[];DATA=null;curSel=null;VR=null;TC=null;FA=[];WC=[];hiddenCls.clear();
+  $('#v_out').innerHTML='';$('#tr_out').innerHTML='';$('#v_apiBox').innerHTML='';
+  if(mapReady){landG.clearLayers();plotG.clearLayers();ovG.clearLayers();apiG.clearLayers();$('#drawer').hidden=true;plotLayers={};selLayer=null}
+  const h=location.hash.split('?')[0];if(location.hash&&h!==location.hash)location.hash=h;else route(false)}
 
 /* ---------- static i18n ---------- */
 function applyStatic(){document.documentElement.lang=lang;document.title=t('brand')+' — '+t('tagline');
   $$('[data-i18n]').forEach(e=>e.textContent=t(e.dataset.i18n));$$('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
   $$('#langSeg button').forEach(b=>b.classList.toggle('on',b.dataset.lang===lang));$$('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.role===role));
-  $$('#modeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.mode===dataMode));setMode(dataMode);
+  applyModeUI();$$('select').forEach(e=>{if(e._items&&e._ph){const v=e.value;fillApiSelect(e,e._items,e._ph);e.value=v}});
   $('#navAdmin').style.display=role==='admin'?'':'none'}
 $('#langSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;lang=b.dataset.lang;localStorage.lang=lang;applyStatic();route(true)};
-$('#modeSeg').onclick=e=>{const b=e.target.closest('button');if(b)setMode(b.dataset.mode)};
+$('#modeSeg').onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.mode!==dataMode)switchMode(b.dataset.mode)};
 $('#roleSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;role=b.dataset.role;localStorage.role=role;applyStatic();
   if(role==='admin'&&cur.path.indexOf('/admin')!==0)location.hash='#/admin';else if(role==='user'&&cur.path.indexOf('/admin')===0)location.hash='#/';else route(true)};
 $('#themeBtn').onclick=()=>{const n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.theme=n};
@@ -1201,19 +1444,21 @@ addEventListener('hashchange',()=>route(false));
 /* ---------- home ---------- */
 function renderHome(){
   $('#h_stats').innerHTML=[['stat_ds',STATS.datasets],['stat_plots',STATS.plots],['stat_checks',STATS.checks],['stat_alerts',STATS.alerts],['stat_cases',STATS.cases]].map(([k,v])=>`<div class="stat"><b>${nf(v||0,0)}</b><span>${t(k)}</span></div>`).join('');
-  setMode(dataMode);
+  applyModeUI();
   cascade($('#h_dist'),$('#h_sheet'),false,w=>{if(w==='s')fillPlots($('#h_plots'),$('#h_sheet').value)});fillPlots($('#h_plots'),$('#h_sheet').value)}
-$('#h_division').onchange=()=>{if($('#h_division').value)loadApiDistricts($('#h_division').value).catch(e=>toast(e.message))};
-$('#h_api_dist').onchange=()=>{if($('#h_api_dist').value)loadApiThanas($('#h_division').value,$('#h_api_dist').value).catch(e=>toast(e.message))};
-$('#h_thana').onchange=()=>{if($('#h_thana').value)loadApiMouzas($('#h_division').value,$('#h_api_dist').value,$('#h_thana').value).catch(e=>toast(e.message))};
-$('#h_map').onclick=()=>{if(dataMode==='api'){const d=$('#h_division').value,di=$('#h_api_dist').value,tv=$('#h_thana').value,m=$('#h_mouza').value;if(!d||!di||!tv||!m)return toast(t('need_api_area'));location.hash=`#/map?api=1&division=${d}&district=${di}&thana=${tv}&mouza=${m}`;return}const d=$('#h_dist').value,s=$('#h_sheet').value,p=$('#h_plot').value.trim();if(!d)return toast(t('need_dist'));
-  const ids=s?[s]:sheetsOf(d).map(x=>x.id);location.hash=`#/map?ds=${ids.join(',')}${p&&ids.length===1?'&plot='+encodeURIComponent(p):''}`};
-$('#h_ver').onclick=()=>{if(dataMode==='api'){return $('#h_map').click()}const s=$('#h_sheet').value,p=$('#h_plot').value.trim();if(!s||!p)return toast(t('need_plot'));location.hash=`#/verify?ds=${s}&plot=${encodeURIComponent(p)}`};
-const goPlace=()=>{const v=$('#h_place').value.trim();if(v)location.hash='#/map?place='+encodeURIComponent(v)};
+$('#h_map').onclick=async()=>{
+  if(dataMode==='api'){const id=await loadApiArea('h_');if(id){const p=$('#h_aplot').value.trim();goto('#/map?ds='+id+(p?'&plot='+encodeURIComponent(p):''))}return}
+  const d=$('#h_dist').value,s=$('#h_sheet').value,p=$('#h_plot').value.trim();if(!d)return toast(t('need_dist'));
+  const ids=s?[s]:sheetsOf(d).map(x=>x.id);goto(`#/map?ds=${ids.join(',')}${p&&ids.length===1?'&plot='+encodeURIComponent(p):''}`)};
+$('#h_ver').onclick=async()=>{
+  if(dataMode==='api'){const p=$('#h_aplot').value.trim();if(!p)return toast(t('need_plot'));
+    const id=await loadApiArea('h_');if(id)goto(`#/verify?ds=${id}&plot=${encodeURIComponent(p)}`);return}
+  const s=$('#h_sheet').value,p=$('#h_plot').value.trim();if(!s||!p)return toast(t('need_plot'));goto(`#/verify?ds=${s}&plot=${encodeURIComponent(p)}`)};
+const goPlace=()=>{const v=$('#h_place').value.trim();if(v)goto('#/map?place='+encodeURIComponent(v))};
 $('#h_go').onclick=goPlace;$('#h_place').onkeydown=e=>{if(e.key==='Enter')goPlace()};
 
 /* ---------- map ---------- */
-let map,landG,plotG,apiG,ovG,baseLayer,baseKey='satl',loaded=[],DATA=null,API_DATA=null,plotLayers={},selLayer=null,curSel=null,hiddenCls=new Set(),mapReady=false,pinMark=null,busy=false,searchT;
+let map,landG,plotG,apiG,ovG,baseLayer,baseKey='satl',loaded=[],DATA=null,plotLayers={},selLayer=null,curSel=null,hiddenCls=new Set(),mapReady=false,pinMark=null,busy=false,searchT;
 const esri='https://server.arcgisonline.com/ArcGIS/rest/services/';
 const BASES={
  sat:()=>L.tileLayer(esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:19,maxZoom:22,attribution:'Tiles © Esri'}),
@@ -1228,8 +1473,8 @@ function initMap(){
   if(mapReady)return;mapReady=true;
   map=L.map('map',{zoomControl:false,maxZoom:22}).setView([23.7,90.35],7);
   L.control.zoom({position:'bottomright'}).addTo(map);L.control.scale({imperial:false,position:'bottomleft'}).addTo(map);
-  map.createPane('landPane').style.zIndex=410;map.createPane('plotPane').style.zIndex=420;
-  landG=L.layerGroup().addTo(map);plotG=L.layerGroup().addTo(map);apiG=L.layerGroup().addTo(map);ovG=L.layerGroup().addTo(map);setBase('satl');
+  map.createPane('landPane').style.zIndex=410;map.createPane('plotPane').style.zIndex=420;map.createPane('boundPane').style.zIndex=405;
+  apiG=L.layerGroup().addTo(map);landG=L.layerGroup().addTo(map);plotG=L.layerGroup().addTo(map);ovG=L.layerGroup().addTo(map);setBase('satl');
   $('#lyLand').onchange=e=>e.target.checked?landG.addTo(map):map.removeLayer(landG);
   $('#lyPlot').onchange=e=>e.target.checked?plotG.addTo(map):map.removeLayer(plotG);
   $('#lbl').onchange=updateLabels;map.on('zoomend',updateLabels);map.on('moveend',autoLoad);
@@ -1239,11 +1484,12 @@ function initMap(){
   $('#q').oninput=()=>{clearTimeout(searchT);searchT=setTimeout(renderList,220)};
   const pl=()=>{const v=$('#place').value.trim();if(v)geocode(v)};$('#place').onkeydown=e=>{if(e.key==='Enter')pl()};
   $('#locate').onclick=locateMe;
+  $('#m_apiload').onclick=async()=>{const id=await loadApiArea('m_');if(id)await loadIds([...new Set([...loaded,id])])};
   setInterval(poll,4000)}
 function updateLabels(){map.getContainer().classList.toggle('nolabels',!$('#lbl').checked||map.getZoom()<17)}
 function fitData(){if(!DATA)return fitAll();const g=L.geoJSON([...DATA.plot.features,...DATA.land.features]);if(g.getLayers().length)map.fitBounds(g.getBounds(),{padding:[50,50]})}
 function fitAll(){const b=DSL.filter(d=>d.bbox).flatMap(d=>bbOf(d));if(b.length)map.fitBounds(b,{padding:[60,60],maxZoom:12})}
-function mapUrl(plot){history.replaceState(null,'','#/map'+(loaded.length?`?ds=${loaded.join(',')}${plot?'&plot='+encodeURIComponent(plot):''}`:''))}
+function mapUrl(plot){if(!cur.path.startsWith('/map'))return;history.replaceState(null,'','#/map'+(loaded.length?`?ds=${loaded.join(',')}${plot?'&plot='+encodeURIComponent(plot):''}`:''))}
 function wktGeo(wkt){
   const m=/^\s*(MULTIPOLYGON|POLYGON)\s*(\(.*\))\s*$/is.exec(wkt||'');if(!m)return null;
   const stack=[[]],tokens=m[2].match(/\(|\)|[^()]+/g)||[];
@@ -1253,63 +1499,38 @@ function wktGeo(wkt){
     else stack[stack.length-1].push(...token.split(',').map(p=>p.trim().split(/\s+/).slice(0,2).map(Number)).filter(p=>p.length===2&&p.every(Number.isFinite)));
   }
   if(stack.length!==1||!stack[0].length)return null;
-  const kind=m[1].toUpperCase(),coordinates=stack[0][0];
-  return {type:kind==='POLYGON'?'Polygon':'MultiPolygon',coordinates};
-}
-function apiFeatures(payload,key){const rows=payload&&payload[key]||[];return rows.map((row,i)=>{const geometry=wktGeo(row.geom);return geometry?{type:'Feature',properties:{...row,_api:true,_key:i},geometry}:null}).filter(Boolean)}
-async function loadApiMap(q){
-  const division=q.get('division'),district=q.get('district'),thana=q.get('thana'),mouza=q.get('mouza');
-  if(!BD.divisions.some(x=>x.code===division))BD.divisions=await api('/api/bd/divisions');
-  if(!BD.districts.some(x=>x.code===district))BD.districts=await api('/api/bd/districts?division_code='+encodeURIComponent(division));
-  if(!BD.thanas.some(x=>x.code===thana))BD.thanas=await api(`/api/bd/thanas?division_code=${encodeURIComponent(division)}&district_code=${encodeURIComponent(district)}`);
-  if(!BD.mouzas.some(x=>x.code===mouza))BD.mouzas=await api(`/api/bd/mouzas?division_code=${encodeURIComponent(division)}&district_code=${encodeURIComponent(district)}&thana_code=${encodeURIComponent(thana)}`);
-  const boundary=await api(`/api/bd/map-data?level=forThana&tableName=gis_boundary_upazila&thanaVal=${encodeURIComponent(thana)}`);
-  const divisionInfo=BD.divisions.find(x=>x.code===division),districtInfo=BD.districts.find(x=>x.code===district),thanaInfo=BD.thanas.find(x=>x.code===thana),mouzaInfo=BD.mouzas.find(x=>x.code===mouza);
-  const mcode=mouzaInfo&&mouzaInfo.m_code;
-  const [plots,land]=mcode?await Promise.all([
-    api(`/api/bd/map-data?level=forMauza&tableName=${encodeURIComponent(mcode.toLowerCase())}&mauzaVal=${encodeURIComponent(mouza)}&plotOrLanduse=plot`),
-    api(`/api/bd/map-data?level=forMauza&tableName=${encodeURIComponent(mcode.toLowerCase())}&mauzaVal=${encodeURIComponent(mouza)}&plotOrLanduse=landuse`)
-  ]):[{},{}];
-  API_DATA={boundary,plot:{type:'FeatureCollection',features:apiFeatures(plots,'plots')},land:{type:'FeatureCollection',features:apiFeatures(land,'landuse')},label:(mouzaInfo&&optionText(mouzaInfo))||'API area',division:divisionInfo&&optionText(divisionInfo),district:districtInfo&&optionText(districtInfo),thana:thanaInfo&&optionText(thanaInfo)};
-  apiG.clearLayers();
-  const layers=[];
-  if(boundary&&boundary.geom){const g=wktGeo(boundary.geom);if(g)layers.push(L.geoJSON(g,{style:{color:'#00e5ff',weight:3,fillOpacity:.08}}))}
-  L.geoJSON(API_DATA.land,{style:f=>({color:'#166534',weight:1,fillColor:colorOf(f.properties.maj_class),fillOpacity:.38})}).addTo(apiG);
-  L.geoJSON(API_DATA.plot,{style:{color:'#ffd60a',weight:2,fillOpacity:.04},onEachFeature:(f,l)=>l.bindTooltip(String(f.properties.label||f.properties.plot_no_en||''),{permanent:true,className:'plot-lbl'})}).addTo(apiG);
-  layers.forEach(l=>l.addTo(apiG));const all=apiG.getLayers();if(all.length){const group=L.featureGroup(all);map.fitBounds(group.getBounds(),{padding:[55,55],maxZoom:18})}
-  $('#sub').textContent=`${API_DATA.label} · ${API_DATA.thana||''} · API`;
-  $('#mstats').innerHTML=[[API_DATA.plot.features.length,'m_total'],[API_DATA.land.features.length,'m_parts'],['—','m_area'],[new Set(API_DATA.land.features.map(f=>f.properties.maj_class)).size,'m_cls']].map(([v,k])=>`<div><b>${typeof v==='number'?nf(v,0):v}</b><span>${t(k)}</span></div>`).join('');
-  $('#legend').innerHTML=`<small>${esc(API_DATA.division||'')} · ${esc(API_DATA.district||'')} · ${esc(API_DATA.thana||'')} · ${esc(API_DATA.label||'')}</small>`;
+  return {type:m[1].toUpperCase()==='POLYGON'?'Polygon':'MultiPolygon',coordinates:stack[0][0]};
 }
 async function showMap(q,keep){
   initMap();setTimeout(()=>map.invalidateSize(),60);
-  if(q.get('api')==='1'){landG.clearLayers();plotG.clearLayers();ovG.clearLayers();loaded=[];DATA=null;$('#drawer').hidden=true;try{await loadApiMap(q)}catch(e){toast(e.message)}return}
-  apiG.clearLayers();API_DATA=null;
-  cascade($('#m_dist'),$('#m_sheet'),true,w=>{const d=$('#m_dist').value,s=$('#m_sheet').value;if(!d)return loadIds([]);loadIds(s&&s!=='*'?[s]:sheetsOf(d).map(x=>x.id))});
+  const isApi=dataMode==='api';$('#m_dsNav').hidden=isApi;$('#m_apiNav').hidden=!isApi;
+  if(isApi)bindApi('m_');
+  else cascade($('#m_dist'),$('#m_sheet'),true,w=>{const d=$('#m_dist').value,s=$('#m_sheet').value;if(!d)return loadIds([]);loadIds(s&&s!=='*'?[s]:sheetsOf(d).map(x=>x.id))});
   renderBases();sidebar();
   if(keep){if(curSel)showDrawer(curSel[0],curSel[1]);return}
   const ds=(q.get('ds')||'').split(',').filter(i=>DSL.some(d=>d.id===i));
   if(q.get('place'))return geocode(q.get('place'));
   if(ds.length){if(ds.join()!==loaded.join())await loadIds(ds);const p=q.get('plot');
-    if(p){const f=DATA&&DATA.plot.features.find(f=>String(f.properties.plot_no_en)===p);if(f)selectPlot(f.properties._ds,p,true)}}
+    if(p){const f=DATA&&DATA.plot.features.find(f=>String(f.properties.plot_no_en)===p);if(f)selectPlot(f.properties._ds,p,true);else toast(t('v_notfound'))}}
   else if(!loaded.length){drawOverview();fitAll()}}
 async function loadIds(ids,o={}){
   const fit=o.fit!==false;
   if(!ids.length){loaded=[];DATA=null;curSel=null;$('#drawer').hidden=true;renderData();mapUrl();return}
   try{DATA=await api('/api/data?ids='+ids.join(','));loaded=DATA.ids;renderData();if(fit)fitData();if(o.quiet)toast(t('m_refreshed'));mapUrl(curSel&&curSel[1])}catch(e){toast(e.message)}}
 function renderData(){
-  landG.clearLayers();plotG.clearLayers();plotLayers={};selLayer=null;
-  if(DATA){const op=+$('#op').value;
+  landG.clearLayers();plotG.clearLayers();apiG.clearLayers();plotLayers={};selLayer=null;
+  if(DATA){const op=+$('#op').value,many=DATA.plot.features.length>1500;
+    (DATA.bounds||[]).forEach(b=>[['district','#2563eb',2],['thana','#00e5ff',3]].forEach(([k,c,w])=>{const g=b[k]&&wktGeo(b[k]);if(g)L.geoJSON(g,{pane:'boundPane',interactive:false,style:{color:c,weight:w,fillOpacity:.03}}).addTo(apiG)}));
     L.geoJSON(DATA.land,{pane:'landPane',interactive:false,filter:f=>!hiddenCls.has(f.properties.maj_class),style:f=>({color:'#fff',weight:1,fillColor:colorOf(f.properties.maj_class),fillOpacity:op})}).addTo(landG);
     L.geoJSON(DATA.plot,{pane:'plotPane',style:()=>({color:'#ffd60a',weight:2,fillColor:'#ffd60a',fillOpacity:.04}),onEachFeature:(f,l)=>{
       const p=f.properties;plotLayers[p._ds+'|'+p.plot_no_en]=l;
-      l.bindTooltip(String(p.label??p.plot_no_en),{permanent:true,direction:'center',className:'plot-lbl'});
+      l.bindTooltip(String(p.label??p.plot_no_en),{permanent:!many,sticky:many,direction:'center',className:'plot-lbl'});
       l.on('click',()=>selectPlot(p._ds,String(p.plot_no_en),false));
       l.on('mouseover',()=>l!==selLayer&&l.setStyle({weight:3}));l.on('mouseout',()=>l!==selLayer&&l.setStyle({weight:2}))}}).addTo(plotG);
     if(curSel&&plotLayers[curSel.join('|')])highlight(plotLayers[curSel.join('|')])}
   updateLabels();drawOverview();sidebar()}
 function drawOverview(){ovG.clearLayers();DSL.filter(d=>d.center&&!loaded.includes(d.id)).forEach(d=>{
-  const m=L.marker(d.center,{icon:L.divIcon({className:'',iconSize:[0,0],html:`<div class="ovpin"><b>${esc(dn(d))}</b>${t('f_sheet')} ${X(d.sheet)} · ${nf(d.plots,0)}</div>`})});
+  const m=L.marker(d.center,{icon:L.divIcon({className:'',iconSize:[0,0],html:`<div class="ovpin"><b>${esc(dn(d))}</b>${shl(d)} · ${nf(d.plots,0)}</div>`})});
   m.on('click',async()=>{await loadIds([...loaded,d.id],{fit:false});map.fitBounds(bbOf(d),{padding:[40,40]})});m.addTo(ovG)})}
 async function autoLoad(){
   if(busy||!$('#autoload').checked||map.getZoom()<15)return;const b=map.getBounds();
@@ -1325,16 +1546,18 @@ function sidebar(){
   const lf=DATA?DATA.land.features:[],pf=DATA?DATA.plot.features:[];
   const total=(pf.length?pf:lf).reduce((a,f)=>a+f.properties.area_sqm,0),cs={};
   lf.forEach(f=>{const c=f.properties.maj_class||'?';(cs[c]??={n:0,a:0}).n++;cs[c].a+=f.properties.area_sqm});
-  $('#sub').textContent=loaded.length?`${loaded.length} ${t('m_loaded')} · ${new Date().toLocaleTimeString(lang==='bn'?'bn-BD':'en-GB')}`:t('m_click_ds');
+  $('#sub').textContent=(loaded.length?`${loaded.length} ${t('m_loaded')} · ${new Date().toLocaleTimeString(lang==='bn'?'bn-BD':'en-GB')}`:t('m_click_ds'))+(dataMode==='api'?' · API':'');
   $('#mstats').innerHTML=[[pf.length,'m_total'],[lf.length,'m_parts'],[dec(total),'m_area'],[Object.keys(cs).length,'m_cls']].map(([v,k],i)=>`<div><b>${nf(v,i==2?1:0)}</b><span>${t(k)}</span></div>`).join('');
   $('#legend').innerHTML=Object.entries(cs).map(([c,v])=>`<label class="rw"><input type="checkbox" data-c="${esc(c)}" ${hiddenCls.has(c)?'':'checked'}><span class="sw" style="background:${colorOf(c)}"></span>${esc(cls(c))}<span class="n">${nf(v.n,0)} · ${nf(dec(v.a),1)}</span></label>`).join('')||`<small>${t('m_none')}</small>`;
   $$('#legend input').forEach(i=>i.onchange=()=>{i.checked?hiddenCls.delete(i.dataset.c):hiddenCls.add(i.dataset.c);renderData()});
-  renderList()}
+  renderList();renderSaved()}
+function renderSaved(){if(dataMode!=='api')return;const a=DSL.filter(d=>d.source==='api');$('#m_fb').hidden=!DSL.some(d=>d.fallback);
+  $('#m_saved').innerHTML=a.map(d=>`<div class="rw" data-id="${esc(d.id)}">📍 ${esc(dn(d))} · ${esc(shl(d))}<span class="n">${nf(d.plots,0)}</span></div>`).join('')||`<small>${t('m_none')}</small>`;
+  $$('#m_saved .rw').forEach(e=>e.onclick=()=>loadIds([...new Set([...loaded,e.dataset.id])]).then(()=>{const d=DSL.find(x=>x.id===e.dataset.id);d&&d.bbox&&map.fitBounds(bbOf(d),{padding:[40,40]})}))}
 async function renderList(){
   const q=$('#q').value.trim(),el=$('#plist');let rows=[];
   if(q){try{rows=(await api('/api/search?q='+encodeURIComponent(q))).results}catch(e){}}
   else if(DATA)rows=DATA.plot.features.slice(0,300).map(f=>({ds:f.properties._ds,plot_no:String(f.properties.plot_no_en),label:f.properties.label,area_sqm:f.properties.area_sqm,sheet:(DSL.find(d=>d.id===f.properties._ds)||{}).sheet}));
-  const dd=id=>DSL.find(d=>d.id===id);
   el.innerHTML=rows.map((r,i)=>`<div class="rw" data-i="${i}"><span class="sw" style="background:#ffd60a"></span>${t('v_plot')} ${X(r.label)}${r.district?` <small>· ${esc(nm(r.district))} ${X(r.sheet)}</small>`:''}${r.owner?` <small>· ${esc(nm(r.owner))}</small>`:''}<span class="n">${nf(dec(r.area_sqm))} ${t('u_dec')}</span></div>`).join('')||`<small>${q?t('m_nodata'):t('m_none')}</small>`;
   $$('#plist .rw').forEach(e=>e.onclick=()=>{const r=rows[+e.dataset.i];selectPlot(r.ds,String(r.plot_no),true)})}
 async function showDrawer(ds,no){
@@ -1342,8 +1565,8 @@ async function showDrawer(ds,no){
   try{const r=await api(`/api/verify/${encodeURIComponent(ds)}/${encodeURIComponent(no)}`);if(!curSel||curSel[0]!==ds||curSel[1]!==no)return;
     const vt={safe:'v_verdict_safe',caution:'v_verdict_caution',danger:'v_verdict_danger'}[r.verdict];
     dr.innerHTML=`<button class="icon x" id="dx" style="width:32px;height:32px">✕</button><h3>${t('v_plot')} ${X(r.label)}</h3>
-    <p style="margin:2px 0 10px;color:var(--mu);font-size:14px">${esc(nm(r.district))} · ${t('f_sheet')} ${X(r.sheet)} · ${X(r.mouza)}</p>
-    <span class="badge ${r.verdict}">${t(vt)} · ${nf(r.score,0)}</span>
+    <p style="margin:2px 0 10px;color:var(--mu);font-size:14px">${esc(nm(r.district))} · ${X(r.mouza)}${r.source==='api'?'':' · '+t('f_sheet')+' '+X(r.sheet)}</p>
+    <span class="badge ${r.verdict}">${t(vt)} · ${nf(r.score,0)}</span> <span class="badge ${r.source==='api'?'ok':''}">${t('src_'+r.source)}</span>
     <dl class="kv" style="margin:12px 0"><dt>${t('d_owner')}</dt><dd>${esc(nm(r.owner))}</dd>
     <dt>${t('v_area')}</dt><dd>${nf(dec(r.area_sqm))} ${t('u_dec')}<br><small style="color:var(--mu)">${nf(r.area_sqm,0)} ${t('u_sqm')} · ${nf(r.area_sqm/4046.86,4)} ${t('u_acre')}</small></dd>
     <dt>${t('d_addr')}</dt><dd id="addr">…</dd></dl>
@@ -1368,12 +1591,21 @@ async function geocode(q){
 function locateMe(){if(!navigator.geolocation)return;toast(t('m_locating'));
   navigator.geolocation.getCurrentPosition(p=>{const ll=[p.coords.latitude,p.coords.longitude];if(pinMark)map.removeLayer(pinMark);pinMark=L.circleMarker(ll,{radius:9,color:'#fff',weight:3,fillColor:'#2563eb',fillOpacity:1}).addTo(map).bindPopup(t('m_here')).openPopup();map.setView(ll,17)},e=>toast(e.message),{enableHighAccuracy:true,timeout:10000})}
 let sigSeen=null;
-async function poll(){if(!$('#auto')||!$('#auto').checked)return;try{const s=(await api('/api/version')).sig;if(sigSeen&&s!==sigSeen){DSL=await api('/api/datasets');STATS=await api('/api/stats');
-  cascade($('#m_dist'),$('#m_sheet'),true,()=>{});if(loaded.length)await loadIds(loaded.filter(i=>DSL.some(d=>d.id===i)),{fit:false,quiet:true});else drawOverview()}sigSeen=s}catch(e){}}
+async function poll(){if(!mapReady||!$('#auto').checked||$('#loader').hidden===false)return;const mode=dataMode;
+  try{const s=(await api('/api/version')).sig;if(mode!==dataMode)return;
+    if(sigSeen&&s!==sigSeen){DSL=await api('/api/datasets');STATS=await api('/api/stats');
+      cascade($('#m_dist'),$('#m_sheet'),true,()=>{});
+      if(loaded.length)await loadIds(loaded.filter(i=>DSL.some(d=>d.id===i)),{fit:false,quiet:true});else{drawOverview();sidebar()}}
+    sigSeen=s}catch(e){}}
 
 /* ---------- verify ---------- */
 let vmap=null;
 function renderVerify(keep){
+  const ab=$('#v_apiBox');ab.hidden=dataMode!=='api';
+  if(dataMode==='api'){if(!ab.firstChild||keep){ab.innerHTML=apiBoxHTML('v_');bindApi('v_');
+    $('#v_apiload').onclick=async()=>{const id=await loadApiArea('v_');if(!id)return;const d=DSL.find(x=>x.id===id);if(!d)return;
+      fillDist($('#v_dist'),d.district);fillSheet($('#v_sheet'),d.district,id,false);fillPlots($('#v_plots'),id)}}}
+  else ab.innerHTML='';
   cascade($('#v_dist'),$('#v_sheet'),false,w=>{if(w==='s')fillPlots($('#v_plots'),$('#v_sheet').value)});
   const q=cur.q,ds=q.get('ds'),p=q.get('plot');
   if(!keep&&ds&&p){const d=DSL.find(x=>x.id===ds);if(d){$('#v_dist').value=d.district;fillSheet($('#v_sheet'),d.district,ds,false);$('#v_sheet').value=ds;fillPlots($('#v_plots'),ds);$('#v_plot').value=p;runVerify(ds,p);return}}
@@ -1386,7 +1618,7 @@ function drawReport(){const r=VR;if(!r)return;
   const hist=r.history.map(h=>`<li><b>${t('h_'+h.type)}</b> — ${esc(nm(h.from))} → ${esc(nm(h.to))}<small>${fd(h.date)} · ${t('v_deed')} ${X(h.deed_no)} · ${t('v_case')} ${X(h.case_no)}</small></li>`).join('');
   $('#v_out').innerHTML=`
   <div class="vbanner ${r.verdict}"><div class="gauge" style="--p:${r.score}"><b>${nf(r.score,0)}</b><small>${t('v_score')}</small></div>
-    <div><h2>${t(vt)}</h2><p>${t('v_plot')} ${X(r.label)} · ${esc(nm(r.district))} · ${t('f_sheet')} ${X(r.sheet)} · ${X(r.mouza)}</p>
+    <div><h2>${t(vt)}</h2><p>${t('v_plot')} ${X(r.label)} · ${esc(nm(r.district))} · ${X(r.mouza)}${r.source==='api'?'':' · '+t('f_sheet')+' '+X(r.sheet)}</p>
     <div class="btnrow"><button class="btn sm alt" onclick="print()">🖨 ${t('v_print')}</button><a class="btn sm alt" href="#/map?ds=${encodeURIComponent(r.ds)}&plot=${encodeURIComponent(r.plot_no)}">🗺 ${t('open_map')}</a></div></div></div>
   <div class="vgrid">
    <div class="card"><h3>${t('v_status')}</h3>${r.checks.map(c=>`<div class="ck ${c.level}"><i>${ic[c.level]}</i><span>${t('ck_'+c.key)}</span><em>${t('lv_'+c.level)}</em></div>`).join('')}</div>
@@ -1424,7 +1656,7 @@ function caseBody(c){
 function drawTrack(){const c=TC;if(!c)return;
   $('#tr_out').innerHTML=`<div class="card"><div class="dhead"><div><h2 style="font-size:22px">${c.id}</h2><p style="margin:2px 0 0;color:var(--mu)">${t('tr_plot')} ${X(c.label)} · ${esc(nm(c.district))} · ${t('f_sheet')} ${X(c.sheet)}</p></div><span class="badge ${c.status}">${t('cs_'+c.status)}</span></div>
   <dl class="kv" style="margin-bottom:16px"><dt>${t('tr_buyer')}</dt><dd>${esc(nm(c.buyer))}</dd><dt>${t('tr_seller')}</dt><dd>${esc(nm(c.seller))}</dd><dt>${t('tr_deed')}</dt><dd>${X(c.deed_no)} · ${fd(c.deed_date)}</dd><dt>${t('tr_office')}</dt><dd>${esc(nm(c.office))}</dd></dl>
-  ${caseBody(c)}<div class="btnrow" style="margin-top:14px"><a class="btn sm alt" href="#/verify?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}">🔎 ${t('d_report')}</a></div></div>`}
+  ${caseBody(c)}<div class="btnrow" style="margin-top:14px"><a class="btn sm alt" href="#/verify?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}">🔎 ${t('d_report')}</a><a class="btn sm alt" href="#/map?ds=${encodeURIComponent(c.ds)}&plot=${encodeURIComponent(c.plot_no)}">🗺 ${t('open_map')}</a></div></div>`}
 
 /* ---------- admin ---------- */
 let atab='overview',FA=[],fType='',fStat='',WC=[];
@@ -1432,7 +1664,7 @@ function renderAdmin(){
   const root=$('#a_root');
   if(role!=='admin'){root.innerHTML=`<div class="phead"><div class="card empty" style="padding:40px"><h2>🔒 ${t('a_gate_t')}</h2><p>${t('a_gate_d')}</p><button class="btn" id="a_en">${t('a_enable')}</button></div></div>`;
     $('#a_en').onclick=()=>{role='admin';localStorage.role=role;applyStatic();renderAdmin()};return}
-  root.innerHTML=`<div class="phead"><h1>${t('a_title')}</h1><p><span class="note">${t('a_note')}</span></p></div>
+  root.innerHTML=`<div class="phead"><h1>${t('a_title')} <span class="badge ${dataMode==='api'?'ok':''}" style="vertical-align:middle">${dataMode==='api'?t('mode_api'):t('mode_dataset')}</span></h1><p><span class="note">${t('a_note')}</span></p></div>
   <div class="tabs">${[['overview','a_overview'],['fraud','a_fraud'],['workflow','a_workflow'],['data','a_data']].map(([k,l])=>`<button data-tab="${k}" class="${k===atab?'on':''}">${t(l)}</button>`).join('')}</div><div id="a_body"><div class="empty">${t('loading')}</div></div>`;
   $$('.tabs button').forEach(b=>b.onclick=()=>{atab=b.dataset.tab;renderAdmin()});
   ({overview:aOverview,fraud:aFraud,workflow:aWorkflow,data:aData})[atab]().catch(e=>$('#a_body').innerHTML=`<div class="card empty">${esc(e.message)}</div>`)}
@@ -1441,7 +1673,7 @@ async function aOverview(){const o=await api('/api/admin/overview');
   $('#a_body').innerHTML=`<div class="kpis">${[['a_open',o.open_alerts],['a_high',o.high],['a_prog',o.in_progress],['a_flag',o.flagged],['a_avg',o.avg_days]].map(([k,v])=>`<div class="kpi"><b>${nf(v,0)}</b><span>${t(k)}</span></div>`).join('')}</div>
   <div class="two"><div class="card"><h3>${t('a_bytype')}</h3>${bars(FT.map(f=>[t('ft_'+f),o.by_type[f]||0]))}</div>
   <div class="card"><h3>${t('a_funnel')}</h3>${bars(STAGES.map((s,i)=>[t('sg_'+s),o.by_stage[i]]))}</div></div>
-  <div class="card" style="margin-top:16px"><h3>${t('a_recent')}</h3>${o.recent.map(a=>`<div class="item"><span class="badge ${a.severity}">${t('sev_'+a.severity)}</span> <b>${t('ft_'+a.type)}</b> · ${a.id} · ${t('v_plot')} ${X(a.label)} · ${esc(nm(a.district))} <span class="badge ${a.status}" style="float:right">${t('st_'+a.status)}</span></div>`).join('')}</div>`}
+  <div class="card" style="margin-top:16px"><h3>${t('a_recent')}</h3>${o.recent.map(a=>`<div class="item"><span class="badge ${a.severity}">${t('sev_'+a.severity)}</span> <b>${t('ft_'+a.type)}</b> · ${a.id} · ${t('v_plot')} ${X(a.label)} · ${esc(nm(a.district))} <span class="badge ${a.status}" style="float:right">${t('st_'+a.status)}</span></div>`).join('')||`<div class="empty">${t('m_none')}</div>`}</div>`}
 async function aFraud(){FA=(await api('/api/admin/fraud')).alerts;drawFraud()}
 function drawFraud(){
   const rows=FA.filter(a=>(!fType||a.type===fType)&&(!fStat||a.status===fStat));
@@ -1466,20 +1698,25 @@ function openCase(id){const c=WC.find(x=>x.id===id);if(!c)return;const d=$('#dlg
   $$('#dlg [data-a]').forEach(b=>b.onclick=async()=>{try{const j=await api('/api/admin/workflow/'+c.id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:b.dataset.a})});
     WC=WC.map(x=>x.id===c.id?j.case:x);drawBoard();openCase(c.id)}catch(e){toast(e.message)}});
   if(!d.open)d.showModal()}
-async function aData(){const L=await api('/api/datasets');
-  $('#a_body').innerHTML=`<div class="card tbl" style="padding:6px"><table><thead><tr><th>${t('th_ds')}</th><th>${t('f_district')}</th><th>${t('f_sheet')}</th><th>${t('th_plots')}</th><th>${t('th_parts')}</th><th>${t('th_area')}</th><th></th></tr></thead><tbody>
-  ${L.map(d=>`<tr><td><code>${esc(d.id)}</code></td><td>${esc(dn(d))}</td><td>${X(d.sheet)}</td><td>${nf(d.plots,0)}</td><td>${nf(d.parts,0)}</td><td>${nf(dec(d.area_sqm),1)}</td><td><a class="btn sm alt" href="#/map?ds=${esc(d.id)}">🗺</a></td></tr>`).join('')}</tbody></table></div>
-  <div class="card" style="margin-top:16px"><h3>${t('a_upload_h')}</h3><p style="color:var(--mu);font-size:14px;margin-top:0">${t('a_upload_help')}</p>
+async function aData(){const L=await api('/api/datasets'),isApi=dataMode==='api';
+  $('#a_body').innerHTML=`${L.some(d=>d.fallback)?`<p><span class="note">${t('api_fb')}</span></p>`:''}
+  <div class="card tbl" style="padding:6px"><table><thead><tr><th>${t('th_ds')}</th><th>${t('th_src')}</th><th>${t('f_district')}</th><th>${t('f_sheet')} / ${t('f_mouza')}</th><th>${t('th_plots')}</th><th>${t('th_parts')}</th><th>${t('th_area')}</th><th></th></tr></thead><tbody>
+  ${L.map(d=>`<tr><td><code>${esc(d.id)}</code></td><td><span class="badge ${d.source==='api'?'ok':''}">${t('src_'+d.source)}</span></td><td>${esc(dn(d))}</td><td>${d.source==='api'?esc(shl(d)):X(d.sheet)}</td><td>${nf(d.plots,0)}</td><td>${nf(d.parts,0)}</td><td>${nf(dec(d.area_sqm),1)}</td>
+  <td><div class="btnrow"><a class="btn sm alt" href="#/map?ds=${esc(d.id)}">🗺</a>${d.source==='api'?`<button class="btn sm danger" data-del="${esc(d.id)}">✕</button>`:''}</div></td></tr>`).join('')}</tbody></table></div>
+  ${isApi?`<div class="card" style="margin-top:16px"><h3>${t('a_api_h')}</h3>${apiBoxHTML('a_')}<div class="btnrow" style="margin-top:8px"><button class="btn alt" id="a_apire">${t('a_reload')}</button></div></div>`
+  :`<div class="card" style="margin-top:16px"><h3>${t('a_upload_h')}</h3><p style="color:var(--mu);font-size:14px;margin-top:0">${t('a_upload_help')}</p>
   <div class="formrow" style="grid-template-columns:1fr 1fr 1fr auto"><label class="f"><span>${t('a_name')}</span><input id="u_name" placeholder="gazipur_002"></label>
   <label class="f"><span>${t('a_land_f')}</span><input type="file" id="u_land" accept=".json"></label><label class="f"><span>${t('a_plot_f')}</span><input type="file" id="u_plot" accept=".json"></label>
-  <button class="btn" id="u_go">${t('a_upload_btn')}</button></div></div>`;
-  $('#u_go').onclick=async()=>{const n=$('#u_name').value.trim().toLowerCase(),fs=['land','plot'].map(k=>[k,$('#u_'+k).files[0]]).filter(x=>x[1]);
-    if(!fs.length)return toast(t('a_pick'));try{for(const[k,f]of fs)await api(`/api/admin/upload/${encodeURIComponent(n)}/${k}`,{method:'POST',body:await f.text()});toast(t('a_uploaded'));
-      DSL=await api('/api/datasets');STATS=await api('/api/stats');aData()}catch(e){toast(e.message)}}}
+  <button class="btn" id="u_go">${t('a_upload_btn')}</button></div></div>`}`;
+  $$('[data-del]').forEach(b=>b.onclick=async()=>{if(!confirm(t('a_confirm')))return;
+    try{await api('/api/admin/dataset/'+b.dataset.del,{method:'DELETE'});await refreshData();toast(t('a_deleted'));aData()}catch(e){toast(e.message)}});
+  if(isApi){bindApi('a_');const go=async f=>{const id=await loadApiArea('a_',f);if(id)aData()};$('#a_apiload').onclick=()=>go(false);$('#a_apire').onclick=()=>go(true)}
+  else $('#u_go').onclick=async()=>{const n=$('#u_name').value.trim().toLowerCase(),fs=['land','plot'].map(k=>[k,$('#u_'+k).files[0]]).filter(x=>x[1]);
+    if(!fs.length)return toast(t('a_pick'));try{for(const[k,f]of fs)await api(`/api/admin/upload/${encodeURIComponent(n)}/${k}`,{method:'POST',body:await f.text()});toast(t('a_uploaded'));await refreshData();aData()}catch(e){toast(e.message)}}}
 
 /* ---------- boot ---------- */
 (async()=>{applyStatic();
-  try{[DSL,STATS]=await Promise.all([api('/api/datasets'),api('/api/stats')]);sigSeen=(await api('/api/version')).sig}catch(e){toast(e.message)}
+  try{await refreshData()}catch(e){toast(e.message)}
   route(false)})();
 </script>
 </body>
@@ -1494,7 +1731,7 @@ if __name__ == "__main__":
     ap.add_argument("--no-browser", action="store_true")
     a = ap.parse_args()
     write_demo()
-    print(f"ভূমি দর্পণ  ->  http://{a.host}:{a.port}   (data folder: {DATA_DIR})")
+    print(f"ভূমি দর্পণ  ->  http://{a.host}:{a.port}   (data folder: {DATA_DIR}, API areas: {API_DIR})")
     if not a.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{a.host}:{a.port}")).start()
     app.run(host=a.host, port=a.port, debug=False, threaded=True)
