@@ -1384,8 +1384,7 @@ input[type=checkbox],input[type=radio]{width:auto;margin:0;padding:0;accent-colo
 #drawer{position:absolute;z-index:1000;top:12px;right:12px;width:340px;max-height:calc(100% - 24px);overflow:auto;background:var(--glass);backdrop-filter:blur(12px);border:1px solid var(--ln);border-radius:18px;box-shadow:var(--sh);padding:16px}
 #drawer h3{font-size:19px}#drawer .x{float:right}.dload{padding:20px;text-align:center;color:var(--mu)}
 .plot-lbl{background:rgba(0,0,0,.65);color:#fff;border:0;border-radius:6px;padding:1px 6px;font-weight:600;box-shadow:none}.plot-lbl:before{display:none}.nolabels .plot-lbl{display:none}
-.ovpin{transform:translate(-50%,-100%);background:var(--g);color:var(--on);border-radius:12px;padding:5px 10px;font-size:12px;white-space:nowrap;box-shadow:0 6px 16px rgba(0,0,0,.35);cursor:pointer;text-align:center;font-family:'Hind Siliguri',sans-serif}
-.ovpin b{display:block;font-size:13px}.ovpin:after{content:'';position:absolute;left:50%;bottom:-6px;margin-left:-6px;border:6px solid transparent;border-bottom:0;border-top-color:var(--g)}
+.locpin{background:none!important;border:0!important}.locpin svg{display:block;filter:drop-shadow(0 2px 3px rgba(0,0,0,.5))}
 #toast{position:fixed;z-index:5000;right:16px;bottom:18px;background:#0b1f15;color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;display:none;max-width:90vw;box-shadow:var(--sh)}
 body.map-mode footer{display:none}
 /* api loader popup */
@@ -1935,7 +1934,11 @@ const BASES={
  topo:()=>L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{maxNativeZoom:17,maxZoom:22,attribution:'© OpenTopoMap, OSM'}),
  light:()=>L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{maxNativeZoom:20,maxZoom:22,attribution:'© OSM, © CARTO'}),
  dark:()=>L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxNativeZoom:20,maxZoom:22,attribution:'© OSM, © CARTO'})};
-function setBase(k){baseKey=k;if(baseLayer)map.removeLayer(baseLayer);baseLayer=BASES[k]().addTo(map);baseLayer.eachLayer?baseLayer.eachLayer(l=>l.setZIndex&&l.setZIndex(1)):0;renderBases()}
+const PIN_COLORS={sat:'#ff453a',satl:'#ff453a',osm:'#2563eb',topo:'#7c3aed',light:'#e11d48',dark:'#22d3ee'};
+function pinSvg(c,size){return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true"><path fill="${c}" fill-rule="evenodd" d="M18.364 17.364L12 23.7279L5.63604 17.364C2.12132 13.8492 2.12132 8.15076 5.63604 4.63604C9.15076 1.12132 14.8492 1.12132 18.364 4.63604C21.8787 8.15076 21.8787 13.8492 18.364 17.364ZM12 15C14.2091 15 16 13.2091 16 11C16 8.79086 14.2091 7 12 7C9.79086 7 8 8.79086 8 11C8 13.2091 9.79086 15 12 15ZM12 13C10.8954 13 10 12.1046 10 11C10 9.89543 10.8954 9 12 9C13.1046 9 14 9.89543 14 11C14 12.1046 13.1046 13 12 13Z"/></svg>`}
+function pinIcon(){return L.divIcon({className:'locpin',iconSize:[34,34],iconAnchor:[17,34],popupAnchor:[0,-31],html:pinSvg(PIN_COLORS[baseKey]||'#2563eb',34)})}
+function areaPinIcon(){return L.divIcon({className:'locpin areapin',iconSize:[30,30],iconAnchor:[15,30],popupAnchor:[0,-28],html:pinSvg(PIN_COLORS[baseKey]||'#2563eb',30)})}
+function setBase(k){baseKey=k;if(baseLayer)map.removeLayer(baseLayer);baseLayer=BASES[k]().addTo(map);baseLayer.eachLayer?baseLayer.eachLayer(l=>l.setZIndex&&l.setZIndex(1)):0;renderBases();if(pinMark&&pinMark.setIcon)pinMark.setIcon(pinIcon());if(ovG)ovG.eachLayer(l=>l.setIcon&&l.setIcon(areaPinIcon()))}
 function renderBases(){$('#bases').innerHTML=Object.keys(BASES).map(k=>`<button class="chip ${k===baseKey?'on':''}" data-k="${k}">${t('bm_'+k)}</button>`).join('');$$('#bases .chip').forEach(b=>b.onclick=()=>setBase(b.dataset.k))}
 function initMap(){
   if(mapReady)return;mapReady=true;
@@ -1998,7 +2001,8 @@ function renderData(){
     if(curSel&&plotLayers[curSel.join('|')])highlight(plotLayers[curSel.join('|')])}
   updateLabels();drawOverview();sidebar()}
 function drawOverview(){ovG.clearLayers();DSL.filter(d=>d.center&&!loaded.includes(d.id)).forEach(d=>{
-  const m=L.marker(d.center,{icon:L.divIcon({className:'',iconSize:[0,0],html:`<div class="ovpin"><b>${esc(dn(d))}</b>${shl(d)} · ${nf(d.plots,0)}</div>`})});
+  const m=L.marker(d.center,{icon:areaPinIcon(),title:`${dn(d)} · ${shl(d)}`});
+  m.bindTooltip(`<b>${esc(dn(d))}</b><br>${shl(d)} · ${nf(d.plots,0)}`,{direction:'right',offset:[12,-16]});
   m.on('click',async()=>{await loadIds([...loaded,d.id],{fit:false});map.fitBounds(bbOf(d),{padding:[40,40]})});m.addTo(ovG)})}
 async function autoLoad(){
   if(busy||!$('#autoload').checked||map.getZoom()<15)return;const b=map.getBounds();
@@ -2051,14 +2055,14 @@ async function geocode(q){
   $('#place').value=q;const el=$('#placeRes');el.innerHTML=`<small>${t('loading')}</small>`;
   try{const r=await (await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=bd&limit=6&accept-language=${lang==='bn'?'bn,en':'en'}&q=${encodeURIComponent(q)}`)).json();
     el.innerHTML=r.map((x,i)=>`<div class="rw" data-i="${i}">${ico('pin',15)} <span>${esc(x.display_name.split(',').slice(0,3).join(','))}</span></div>`).join('')||`<small>${t('m_nodata')}</small>`;
-    const go=x=>{const lat=+x.lat,lng=+x.lon;if(pinMark)map.removeLayer(pinMark);pinMark=L.marker([lat,lng]).addTo(map).bindPopup(esc(x.display_name)).openPopup();
+    const go=x=>{const lat=+x.lat,lng=+x.lon;if(pinMark)map.removeLayer(pinMark);pinMark=L.marker([lat,lng],{icon:pinIcon()}).addTo(map).bindPopup(esc(x.display_name)).openPopup();
       const near=DSL.filter(d=>d.center).map(d=>({d,m:map.distance([lat,lng],d.center)})).sort((a,b)=>a.m-b.m)[0];
       if(near&&near.m<4000){toast(t('m_place_hit'));loadIds([...new Set([...loaded,near.d.id])],{fit:false}).then(()=>map.fitBounds(bbOf(near.d),{padding:[40,40]}))}
       else if(x.boundingbox){const b=x.boundingbox.map(Number);map.fitBounds([[b[0],b[2]],[b[1],b[3]]],{maxZoom:17})}else map.setView([lat,lng],16)};
     $$('#placeRes .rw').forEach(e=>e.onclick=()=>go(r[+e.dataset.i]));if(r.length===1||cur.q.get('place'))go(r[0])
   }catch(e){el.innerHTML=`<small>${t('err')}: ${esc(e.message)}</small>`}}
 function locateMe(){if(!navigator.geolocation)return;toast(t('m_locating'));
-  navigator.geolocation.getCurrentPosition(p=>{const ll=[p.coords.latitude,p.coords.longitude];if(pinMark)map.removeLayer(pinMark);pinMark=L.circleMarker(ll,{radius:9,color:'#fff',weight:3,fillColor:'#2563eb',fillOpacity:1}).addTo(map).bindPopup(t('m_here')).openPopup();map.setView(ll,17)},e=>toast(e.message),{enableHighAccuracy:true,timeout:10000})}
+  navigator.geolocation.getCurrentPosition(p=>{const ll=[p.coords.latitude,p.coords.longitude];if(pinMark)map.removeLayer(pinMark);pinMark=L.marker(ll,{icon:pinIcon()}).addTo(map).bindPopup(t('m_here')).openPopup();map.setView(ll,17)},e=>toast(e.message),{enableHighAccuracy:true,timeout:10000})}
 let sigSeen=null;
 async function poll(){if(!ME||!mapReady||!$('#auto').checked||$('#loader').hidden===false)return;const mode=dataMode;
   try{const s=(await api('/api/version')).sig;if(mode!==dataMode)return;
@@ -2105,7 +2109,8 @@ function drawReport(){const r=VR;if(!r)return;
   </div>`;
   if(vmap){vmap.remove();vmap=null}
   vmap=L.map('vmap',{zoomControl:false,attributionControl:false});L.tileLayer(esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:21,maxNativeZoom:19}).addTo(vmap);
-  const g=L.geoJSON(r.geometry,{style:{color:'#ffd60a',weight:3,fillOpacity:.18}}).addTo(vmap);vmap.fitBounds(g.getBounds(),{maxZoom:19,padding:[24,24]})}
+  const g=L.geoJSON(r.geometry,{style:{color:'#ffd60a',weight:3,fillOpacity:.18}}).addTo(vmap);
+  const b=g.getBounds(),z=vmap.getBoundsZoom(b,false,[24,24]);vmap.setView(b.getCenter(),Math.max(z-1,1))}
 
 /* ---------- tracking ---------- */
 function renderTrack(keep){
