@@ -1539,8 +1539,7 @@ body.auth-mode main{margin-left:0}
  .pd-sign div{border-top:1px solid #000;padding-top:4px;text-align:center;font-size:9.5pt}
  .pd-bar{text-align:center;margin-top:16px;break-inside:avoid}.pd-bar svg{max-width:78mm;height:auto}
  .pd-disc{font-size:8.8pt;border:1px solid #000;padding:6px 9px;margin-top:10px;text-align:justify}
- .pd-foot{position:fixed;bottom:-14mm;left:0;right:0;font-size:8pt;border-top:1px solid #000;padding-top:2px;text-align:center}
-}
+ }
 </style>
 <!--HARDEN-->
 </head>
@@ -1741,8 +1740,9 @@ m_total:["মোট দাগ","Plots"],m_parts:["ভূমি অংশ","Land 
 m_click_ds:["লোড করতে ক্লিক করুন","Click to load"],m_none:["কোনো ডেটা নেই","No data"],m_refreshed:["ডেটা হালনাগাদ হয়েছে","Data refreshed"],m_loaded:["লোড হয়েছে","loaded"],m_nodata:["কিছু পাওয়া যায়নি","Nothing found"],
 m_locating:["অবস্থান খোঁজা হচ্ছে…","Locating…"],m_here:["আপনার অবস্থান","You are here"],m_place_hit:["এলাকায় ডেটাসেট পাওয়া গেছে — লোড হচ্ছে","Dataset found nearby — loading"],
 bm_sat:["স্যাটেলাইট","Satellite"],bm_satl:["স্যাটেলাইট + লেবেল","Satellite + labels"],bm_osm:["ওএসএম","OSM"],bm_topo:["ভূসংস্থান","Topo"],bm_light:["হালকা","Light"],bm_dark:["গাঢ়","Dark"],
-c_Settlement:["বসতবাড়ি","Settlement"],c_Agriculture:["কৃষি","Agriculture"],c_Agricultural_Land:["কৃষি","Agricultural"],c_Commercial_Area:["বাণিজ্যিক","Commercial"],c_Water_Body:["জলাশয়","Water body"],c_Waterbody:["জলাশয়","Water body"],c_Educational_Institution:["শিক্ষাপ্রতিষ্ঠান","Educational institution"],c_Recreational_Place:["বিনোদনমূলক স্থান","Recreational space"],c_Road:["সড়ক","Road"],c_Religious_Place:["ধর্মীয় স্থান","Religious Place"],c_Industrial_Area:["শিল্প এলাকা","Industrial"],c_Forest:["বন","Forest"],c_Administrative_Area:["প্রশাসনিক এলাকা","Administrative Area"],c_Vacant_Land:["পতিত জমি","Vacant land"],c_Miscellaneous_Landuse:["বিবিধ","Miscellaneous land"],
+c_Settlement:["বসতবাড়ি","Settlement"],c_Agriculture:["কৃষি","Agriculture"],c_Agricultural_Land:["কৃষি","Agricultural"],c_Commercial_Area:["বাণিজ্যিক","Commercial"],c_Water_Body:["জলাশয়","Water body"],c_Waterbody:["জলাশয়","Water body"],c_Educational_Institution:["শিক্ষাপ্রতিষ্ঠান","Educational institution"],c_Recreational_Place:["বিনোদনমূলক স্থান","Recreational space"],c_Road:["সড়ক","Road"],c_Religious_Place:["ধর্মীয় স্থান","Religious Place"],c_Industrial_Area:["শিল্প এলাকা","Industrial"],c_Forest:["বন","Forest"],c_Administrative_Area:["প্রশাসনিক এলাকা","Administrative Area"],c_Vacant_Land:["পতিত জমি","Vacant land"],c_Miscellaneous_Landuse:["বিবিধ","Miscellaneous land"],c_Terminal:["টার্মিনাল","Terminal"],
 s_Homestead:["বাড়ি","Homestead"],s_Paddy_Field:["ধানি জমি","Paddy field"],s_Shop:["দোকান","Shop"],s_Pond:["পুকুর","Pond"],s_Fallow:["পতিত","Fallow"],s_Garment_Factory:["পোশাক কারখানা","Garment factory"],
+s_Access_Road:["প্রবেশ পথ","Access road"],s_Agroforestry:["কৃষি বনায়ন","Agroforestry"],s_Area_Under_Development:["উন্নয়নাধীন এলাকা","Area under development"],s_Betel_Leaf_Trellis:["পানের বরজ","Betel leaf trellis"],s_Canal:["খাল","Canal"],s_Commercial_Area:["বাণিজ্যিক এলাকা","Commercial area"],s_Cultivable_Fallow_Land:["চাষযোগ্য পতিত জমি","Cultivable fallow land"],s_Ditch:["পরিখা","Ditch"],s_Double_Crop_Land:["দ্বিফসলি জমি","Double crop land"],s_Mosque:["মসজিদ","Mosque"],s_Office_Compound:["অফিস প্রাঙ্গণ","Office compound"],s_Open_Space:["খোলা জায়গা","Open space"],s_Orchard:["ফলের বাগান","Orchard"],s_Playground:["খেলার মাঠ","Playground"],s_Rail_Station:["রেল স্টেশন","Rail station"],s_Railway:["রেলপথ","Railway"],s_Right_of_Way:["অধিকারপথ","Right of way"],s_River:["নদী","River"],s_Rural_Road:["গ্রামীণ সড়ক","Rural road"],s_Rural_Settlement_with_Homestead_Vegetation:["বসতভিটা ও গাছপালাসহ গ্রামীণ বসতি","Rural settlement with homestead vegetation"],s_School_College_Madrasha:["স্কুল/কলেজ/মাদ্রাসা","School/College/Madrasha"],s_Single_Crop_Land:["একফসলি জমি","Single crop land"],s_Stadium:["স্টেডিয়াম","Stadium"],s_Triple_Crop_Land:["ত্রিফসলি জমি","Triple crop land"],s_Upazila_Road:["উপজেলা সড়ক","Upazila road"],s_Urban_Built_up_Area:["শহরাঞ্চলীয় নির্মিত এলাকা","Urban built-up area"],
 u_dec:["শতাংশ","decimal"],u_acre:["একর","acre"],u_sqm:["বর্গমিটার","sq.m"],
 d_owner:["মালিক","Owner"],d_risk:["ঝুঁকি","Risk"],d_report:["পূর্ণ যাচাই রিপোর্ট","Full verification report"],d_share:["লিংক কপি","Copy link"],d_gmaps:["গুগল ম্যাপে খুলুন","Open in Google Maps"],d_copied:["লিংক কপি হয়েছে","Link copied"],d_addr:["ঠিকানা","Address"],
 loading:["লোড হচ্ছে…","Loading…"],close:["বন্ধ","Close"],open_map:["মানচিত্রে দেখুন","View on map"],err:["ত্রুটি","Error"],days:["দিন","days"],
@@ -1788,7 +1788,7 @@ const dec=m=>m/40.4686;
 const nm=o=>o?(o[lang]||o.bn):'';
 const dn=d=>lang==='bn'?d.district_bn:d.district_en;
 const fd=s=>{try{return D(new Date(s).toLocaleDateString(lang==='bn'?'bn-BD':'en-GB',{day:'numeric',month:'short',year:'numeric'}))}catch(e){return s}};
-const key=s=>String(s||'').replace(/ /g,'_');
+const key=s=>String(s||'').replace(/[^A-Za-z0-9]+/g,'_');
 const cls=c=>T['c_'+key(c)]?t('c_'+key(c)):(c||'—');
 const sub=c=>T['s_'+key(c)]?t('s_'+key(c)):(c||'—');
 const toast=m=>{const e=$('#toast');e.textContent=m;e.style.display='block';clearTimeout(toast.h);toast.h=setTimeout(()=>e.style.display='none',2800)};
@@ -2251,7 +2251,7 @@ pr_s4:["স্বয়ংক্রিয় যাচাই ও ঝুঁকি
 pr_s7:["হস্তান্তর ও নামজারির ধারাবাহিক ইতিহাস","Chronology of transfers & mutations"],pr_s8:["মতামত ও সুপারিশ","Opinion & recommendations"],
 pr_date:["তারিখ","Date"],pr_nature:["প্রকৃতি","Nature"],pr_parties:["পক্ষসমূহ (হস্তান্তরকারী → গ্রহীতা)","Parties (transferor → transferee)"],pr_chk:["যাচাইয়ের বিষয়","Check"],pr_res:["ফলাফল","Result"],pr_cls:["শ্রেণি","Class"],pr_use:["ব্যবহার","Use"],
 pr_decl:["এতদ্বারা প্রত্যয়ন করা যাইতেছে যে, উপর্যুক্ত দাগের ভূমি সম্পর্কে সরকারি ভূমি মানচিত্র সেবা হইতে প্রাপ্ত জ্যামিতিক তথ্য এবং এই প্ল্যাটফর্মের যাচাই ইঞ্জিনের বিশ্লেষণের ভিত্তিতে এই প্রতিবেদন প্রস্তুত করা হইয়াছে। প্রতিবেদনে উল্লিখিত তথ্য প্রস্তুতের তারিখ পর্যন্ত হালনাগাদ।","It is hereby certified that this report has been prepared on the basis of geometric data obtained from the government land-map service and the analysis of this platform's verification engine in respect of the plot described above. The particulars stated are current as of the date of issue."],
-pr_disc:["দ্রষ্টব্য: এই প্রতিবেদন কেবল তথ্যগত সহায়তার জন্য প্রদত্ত; ইহা মালিকানার চূড়ান্ত প্রমাণ, খতিয়ান, পর্চা বা আদালতে গ্রহণযোগ্য দলিল নহে। মালিকানা, মামলা ও জালিয়াতি সংক্রান্ত তথ্য এই MVP-তে কাল্পনিক (ডেমো)। কোনো লেনদেনের পূর্বে ইউনিয়ন ভূমি অফিস ও সাব-রেজিস্ট্রি অফিস হইতে মূল রেকর্ড যাচাই করুন।","Note: This report is provided for information only and is not conclusive proof of title, a khatian, a porcha or a document admissible in court. Ownership, case and fraud particulars in this MVP are fictional (demo). Verify original records at the union land office and sub-registry office before any transaction."],
+pr_disc:["দ্রষ্টব্য: এটি শুধুমাত্র তথ্যগত ডেমো প্রতিবেদন — মালিকানার প্রমাণ বা আদালতে গ্রহণযোগ্য দলিল নয়। কোনো লেনদেনের আগে ইউনিয়ন ভূমি অফিস ও সাব-রেজিস্ট্রি থেকে মূল রেকর্ড যাচাই করুন।","Note: This is a demo report for information only — not proof of title or a court-admissible document. Verify original records at the union land office and sub-registry before any transaction."],
 pr_sig1:["প্রস্তুতকারী: আমার ভূমি যাচাই ইঞ্জিন (স্বয়ংক্রিয়)","Prepared by: AmarBhumi verification engine (automated)"],pr_sig2:["যাচাইকারী কর্মকর্তার স্বাক্ষর ও সিল","Signature & seal of verifying officer"],pr_pg:["অনলাইনে যাচাই:","Verify online:"]});
 let ME=null,CFG={},JSEL=null;
 const post=async(u,b)=>{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j};
@@ -2311,14 +2311,13 @@ function printReport(){const r=VR;if(!r)return;
    kv=rows=>`<table class="pd-kv">${rows.map(([a,b])=>`<tr><th>${a}</th><td>${b}</td></tr>`).join('')}</table>`,
    tb=(h,rows)=>`<table><thead><tr>${h.map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.map(c=>`<tr>${c.map(x=>`<td>${x}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
   const vt={safe:'v_verdict_safe',caution:'v_verdict_caution',danger:'v_verdict_danger'}[r.verdict];
-  $('#printDoc').innerHTML=`<div class="pd-foot">${t('pr_ref')}: ${esc(ref)} · ${t('pr_pg')} ${esc(url)}</div>
-  <header class="pd-head"><div><img src="/assets/logo.png" alt="" style="height:44px"><h1>${t('pr_title')}</h1><p>${t('pr_subt')}</p></div><div class="pd-qr">${qrSvg(url)}${t('pr_scan')}</div></header>
+  $('#printDoc').innerHTML=`<header class="pd-head"><div><img src="/assets/logo.png" alt="" style="height:44px"><h1>${t('pr_title')}</h1><p>${t('pr_subt')}</p></div><div class="pd-qr">${qrSvg(url)}${t('pr_scan')}</div></header>
   <div class="pd-meta"><div><b>${t('pr_ref')}</b>${esc(ref)}</div><div><b>${t('pr_issued')}</b>${fd(now)}</div><div><b>${t('pr_for')}</b>${esc(ME?nm(ME.name):'—')}</div></div>
   ${sec(1,'pr_s1',kv([[t('f_district'),esc(nm(r.district))],[t('v_mouza'),`${X(r.mouza)} (${X(r.m_code)})`],['JL',X(r.jl||'—')],[t('v_dag'),X(r.dag)],[t('v_khatian'),X(r.khatian)],[t('v_area'),`${nf(dec(r.area_sqm))} ${t('u_dec')} · ${nf(r.area_sqm/4046.86,4)} ${t('u_acre')} · ${nf(r.area_sqm,0)} ${t('u_sqm')}`]]))}
   ${sec(2,'pr_s2',kv([[t('v_owner'),esc(nm(r.owner))],[t('v_father'),esc(nm(r.father))],[t('v_nid'),X(r.nid)],[t('v_share'),X(r.share)]]))}
   ${sec(3,'pr_s3',tb([t('pr_cls'),t('pr_use'),t('v_area')+' ('+t('u_dec')+')'],r.parts.length?r.parts.map(p=>[esc(cls(p.maj)),esc(sub(p.sub)),nf(dec(p.area_sqm),2)]):[['—','—','—']]))}
-  ${sec(4,'pr_s4',tb([t('pr_chk'),t('pr_res')],r.checks.map(c=>[t('ck_'+c.key),`<span class="pd-res">${t('lv_'+c.level)}</span>`]).concat([[t('v_score'),`<span class="pd-res">${nf(r.score,0)} / ${nf(100,0)} — ${t(vt)}</span>`]])))}
-  ${sec(5,'pr_s5',`<ol>${r.pending.map(p=>`<li>${t('p_'+p.type)} — ${X(p.ref)} (${t('fo_'+p.forum)}, ${t('v_since')} ${fd(p.since)})</li>`).join('')||`<li>${t('v_nopending')}</li>`}<li>${t('kh_'+r.khas)}</li><li>${t('aq_'+r.acq)}</li></ol>`)}
+  ${sec(4,'pr_s5',`<ol>${r.pending.map(p=>`<li>${t('p_'+p.type)} — ${X(p.ref)} (${t('fo_'+p.forum)}, ${t('v_since')} ${fd(p.since)})</li>`).join('')||`<li>${t('v_nopending')}</li>`}<li>${t('kh_'+r.khas)}</li><li>${t('aq_'+r.acq)}</li></ol>`)}
+  ${sec(5,'pr_s4',tb([t('pr_chk'),t('pr_res')],r.checks.map(c=>[t('ck_'+c.key),`<span class="pd-res">${t('lv_'+c.level)}</span>`]).concat([[t('v_score'),`<span class="pd-res">${nf(r.score,0)} / ${nf(100,0)} — ${t(vt)}</span>`]])))}
   ${sec(6,'pr_s6',r.flags.length?`<ol>${r.flags.map(f=>`<li><b>${t('ft_'+f.type)}</b> (${t('sev_'+f.severity)}, ${nf(f.confidence,0)}%)<br>${f.evidence.map(e=>X(nm(e))).join('; ')}</li>`).join('')}</ol>`:`<p style="margin:0">${t('v_noflags')}</p>`)}
   ${sec(7,'pr_s7',tb([t('pr_date'),t('pr_nature'),t('pr_parties'),t('v_deed')+' / '+t('v_case')],r.history.map(h=>[fd(h.date),t('h_'+h.type),`${esc(nm(h.from))} → ${esc(nm(h.to))}`,`${X(h.deed_no)} / ${X(h.case_no)}`])))}
   ${sec(8,'pr_s8',`<ol>${r.advice.map(a=>`<li>${X(nm(a))}</li>`).join('')}</ol>`)}
