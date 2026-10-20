@@ -39,7 +39,7 @@ import webbrowser
 import zlib
 from datetime import date, timedelta
 
-from flask import Flask, Response, jsonify, redirect, request, has_request_context, send_file
+from flask import Flask, Response, jsonify, redirect, request, has_request_context, send_file, session
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE, "data")
@@ -48,6 +48,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(API_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
+app.secret_key = os.environ.get("BD_SECRET", "amarbhumi-dev-secret-change-me")
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 TODAY = date.today()
 CUSTOM_FILE = os.path.join(DATA_DIR, "admin_custom.json")
 STATE = {"fraud": {}, "wf": {}, "rev": {"dataset": 0, "api": 0},
@@ -102,8 +104,7 @@ def cur_mode():
     """'api' or 'dataset' — taken from the request, defaulting to API mode."""
     if not has_request_context():
         return "api"
-    m = request.headers.get("X-Data-Mode") or request.args.get("mode") or ""
-    return "dataset" if m == "dataset" else "api"
+    return "api"  # single source: government API (demo data is the automatic fallback)
 
 
 # ----------------------------------------------------------------- government map service proxy
@@ -644,11 +645,92 @@ def err(msg, code=400):
     return jsonify(error=msg), code
 
 
+JUDGE_PW = "judge@2026"
+_T = lambda bn, en: {"bn": bn, "en": en}
+DEMO_USERS = [
+    {"id": "admin1", "email": "rafiq.admin@amarbhumi.demo", "role": "admin", "name": _T("রফিকুল ইসলাম", "Rafiqul Islam"), "title": _T("সহকারী কমিশনার (ভূমি)", "Assistant Commissioner (Land)")},
+    {"id": "admin2", "email": "nusrat.admin@amarbhumi.demo", "role": "admin", "name": _T("নুসরাত জাহান", "Nusrat Jahan"), "title": _T("রেজিস্ট্রি অডিটর", "Registry Auditor")},
+    {"id": "user1", "email": "karim.user@amarbhumi.demo", "role": "user", "name": _T("করিম উদ্দিন", "Karim Uddin"), "title": _T("জমি ক্রেতা", "Land buyer")},
+    {"id": "user2", "email": "sumaiya.user@amarbhumi.demo", "role": "user", "name": _T("সুমাইয়া আক্তার", "Sumaiya Akter"), "title": _T("জমির মালিক", "Landowner")},
+    {"id": "user3", "email": "tanvir.user@amarbhumi.demo", "role": "user", "name": _T("তানভীর হাসান", "Tanvir Hasan"), "title": _T("আইনজীবী", "Advocate")},
+]
+
+
+def _pub(u):
+    return {k: u.get(k, "") for k in ("id", "email", "name", "role", "title", "picture")}
+
+
+def _login(u, judge):
+    session.clear()
+    session["u"], session["judge"] = _pub(u), judge
+
+
 @app.before_request
-def _admin_guard():
-    if ADMIN_KEY and request.path.startswith("/api/admin/"):
-        if not hmac.compare_digest(request.headers.get("X-Admin-Key", ""), ADMIN_KEY):
-            return err("admin key required / অ্যাডমিন কী প্রয়োজন", 401)
+def _auth_guard():
+    p = request.path
+    if not p.startswith("/api/") or p.startswith("/api/auth/"):
+        return None
+    u = session.get("u")
+    if not u:
+        return err("login required / লগইন প্রয়োজন", 401)
+    if p.startswith("/api/admin/") and u.get("role") != "admin":
+        return err("admin only / শুধু অ্যাডমিন", 403)
+    return None
+
+
+@app.route("/api/auth/me")
+def auth_me():
+    return jsonify(user=session.get("u"), judge=bool(session.get("judge")),
+                   google_client_id=os.environ.get("GOOGLE_CLIENT_ID", ""),
+                   demo=[_pub(u) for u in DEMO_USERS], demo_password=JUDGE_PW)
+
+
+@app.route("/api/auth/judge", methods=["POST"])
+def auth_judge():
+    b = request.get_json(silent=True) or {}
+    u = next((x for x in DEMO_USERS if x["id"] == b.get("id")), None)
+    if not u or not hmac.compare_digest(str(b.get("password", "")), JUDGE_PW):
+        return err("invalid demo credential", 401)
+    _login(u, True)
+    return jsonify(user=session["u"], judge=True)
+
+
+@app.route("/api/auth/switch", methods=["POST"])
+def auth_switch():
+    if not session.get("judge"):
+        return err("switching is available in judge sessions only", 403)
+    u = next((x for x in DEMO_USERS if x["id"] == (request.get_json(silent=True) or {}).get("id")), None)
+    if not u:
+        return err("unknown account", 404)
+    _login(u, True)
+    return jsonify(user=session["u"], judge=True)
+
+
+@app.route("/api/auth/google", methods=["POST"])
+def auth_google():
+    cid = os.environ.get("GOOGLE_CLIENT_ID", "")
+    tok = (request.get_json(silent=True) or {}).get("credential", "")
+    if not cid or not tok:
+        return err("Google sign-in is not configured (set GOOGLE_CLIENT_ID)", 400)
+    try:
+        with urllib.request.urlopen("https://oauth2.googleapis.com/tokeninfo?id_token=" + urllib.parse.quote(tok), timeout=10) as r:
+            info = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return err("Google token could not be verified", 401)
+    if info.get("aud") != cid or str(info.get("email_verified")).lower() != "true":
+        return err("Google token rejected", 401)
+    em = info["email"].lower()
+    admins = {e.strip().lower() for e in os.environ.get("BD_ADMIN_EMAILS", "").split(",") if e.strip()}
+    nm = info.get("name") or em
+    _login({"id": "g_" + info["sub"], "email": em, "name": _T(nm, nm), "role": "admin" if em in admins else "user",
+            "title": _T("গুগল অ্যাকাউন্ট", "Google account"), "picture": info.get("picture", "")}, False)
+    return jsonify(user=session["u"], judge=False)
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    session.clear()
+    return jsonify(ok=True)
 
 
 @app.after_request
@@ -1133,9 +1215,11 @@ PAGE = r"""<!doctype html>
 <title>আমার ভূমি</title>
 <script>try{document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');matchMedia('(prefers-color-scheme:dark)').addEventListener('change',e=>{if(!localStorage.theme)document.documentElement.dataset.theme=e.matches?'dark':'light'});}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Noto+Sans+Bengali:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Noto+Sans+Bengali:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Noto+Serif+Bengali:wght@400;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.6/JsBarcode.all.min.js"></script>
 <style>
 :root{--nav:64px;--bg:#f3f8f4;--sf:#fff;--sf2:#eef5f0;--tx:#0f2218;--mu:#5a6f62;--ln:#dce8e0;--g:#0b7d4c;--g2:#16a96b;--gt:#e1f4e8;--on:#fff;
 --wr:#b45309;--wrt:#fef3c7;--bd:#b91c1c;--bdt:#fee2e2;--sh:0 10px 30px rgba(8,50,30,.10);--glass:rgba(255,255,255,.86);--top-nav:rgba(255,255,255,.66)}
@@ -1401,6 +1485,60 @@ main{margin-left:var(--side-nav);transition:margin-left .25s}
  .brand span:last-child,.mode-label{display:none}
  .nav-in{gap:8px}
 }
+/* ===== v3: auth, nav, user menu, print ===== */
+.mode-label,.modeSeg{display:none!important}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.mu{color:var(--mu)}
+.nav-links{padding:14px 12px}
+.nav-links a{gap:11px;border-radius:12px;position:relative;font-weight:500}
+.nav-links a.on{background:var(--gt);color:var(--g);font-weight:600}
+.nav-links a.on:before{content:'';position:absolute;left:-12px;top:9px;bottom:9px;width:4px;border-radius:0 4px 4px 0;background:var(--g)}
+.ngrp{font-size:11px;font-weight:700;color:var(--mu);padding:16px 13px 6px}
+.nfoot{margin-top:auto;padding:12px;border:1px solid var(--ln);border-radius:14px;background:var(--sf2);font-size:13px;display:flex;gap:10px;align-items:center}
+.nfoot b{display:block}
+.avatar{overflow:hidden;flex:none}.avatar img{width:100%;height:100%;object-fit:cover}
+.uwrap{position:relative}
+.ubtn{display:flex;align-items:center;gap:8px;border:1px solid var(--ln);background:var(--sf);color:var(--tx);border-radius:12px;padding:3px 10px 3px 4px;cursor:pointer;font:inherit}
+.uname{font-size:14px;font-weight:600;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.umenu{position:absolute;right:0;top:calc(100% + 8px);width:min(330px,92vw);background:var(--sf);border:1px solid var(--ln);border-radius:16px;box-shadow:var(--sh);padding:10px;z-index:3000;max-height:80vh;overflow:auto}
+.umenu h5{margin:12px 8px 4px;font-size:11px;color:var(--mu);font-weight:700}
+.urow{display:flex;gap:10px;align-items:center;width:100%;border:0;background:none;color:var(--tx);font:inherit;text-align:left;padding:8px;border-radius:10px;cursor:pointer}
+.urow:hover{background:var(--sf2)}.urow.on{background:var(--gt)}.urow small{display:block;color:var(--mu)}.urow .badge{margin-left:auto}
+body.auth-mode .nav-links,body.auth-mode #userWrap,body.auth-mode #burger{display:none!important}
+body.auth-mode main{margin-left:0}
+.login{min-height:calc(100vh - var(--nav));display:grid;grid-template-columns:1.1fr 1fr}
+.login-art{color:#fff;padding:56px;display:flex;flex-direction:column;justify-content:flex-end;background:linear-gradient(180deg,rgba(4,30,18,.30),rgba(4,30,18,.93)),url('/assets/heto_1.jpeg') center/cover}
+.login-art h1{font-size:clamp(28px,3.4vw,42px);margin:14px 0 10px}.login-art p{opacity:.92;max-width:480px;margin:0}.login-art .pill{align-self:flex-start}
+.login-wrap{display:grid;place-items:center;padding:28px}.login-card{width:min(440px,100%);display:grid;gap:14px}
+.login-card .logo{margin-bottom:4px}.login-card h2{font-size:26px}
+.gdis{display:flex;gap:10px;align-items:center;justify-content:center;width:100%;opacity:.7;cursor:not-allowed}
+@media(max-width:860px){.login{grid-template-columns:1fr}.login-art{display:none}}
+#printDoc{display:none}
+@media print{
+ @page{size:A4;margin:14mm 14mm 20mm}
+ html,body{background:#fff!important}
+ body>*:not(#printDoc){display:none!important}
+ #printDoc{display:block!important;color:#000;font-family:'Noto Serif Bengali','Times New Roman',serif;font-size:10.5pt;line-height:1.75;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+ #printDoc *{letter-spacing:0!important;text-transform:none!important}
+ .pd-head{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:center;border-bottom:3px double #000;padding-bottom:8px}
+ .pd-head h1{font-size:19pt;margin:6px 0 0}.pd-head p{margin:2px 0 0;font-size:9.5pt}
+ .pd-qr{text-align:center;font-size:8pt;width:30mm}.pd-qr svg{width:28mm;height:28mm;display:block;margin:0 auto 2px}
+ .pd-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 14px;border:1px solid #000;padding:6px 10px;margin:10px 0;font-size:9.5pt}
+ .pd-meta b{display:block;font-size:8.5pt;font-weight:600}
+ .pd-sec{break-inside:avoid;margin:11px 0}.pd-sec h3{font-size:11.5pt;margin:0 0 5px;padding-bottom:2px;border-bottom:1px solid #000}
+ #printDoc table{width:100%;border-collapse:collapse;font-size:9.8pt}
+ #printDoc th,#printDoc td{border:1px solid #333;padding:3px 7px;text-align:left;vertical-align:top}
+ #printDoc th{background:#ececec!important;font-weight:600}.pd-kv th{width:32%}
+ #printDoc thead{display:table-header-group}#printDoc tr{break-inside:avoid}
+ .pd-sec ol{margin:0;padding-left:22px}.pd-sec li{margin-bottom:3px}
+ .pd-res{font-weight:700}
+ .pd-decl{text-align:justify;margin:12px 0;text-indent:24px}
+ .pd-sign{display:grid;grid-template-columns:1fr 1fr;gap:40px;margin-top:34px;break-inside:avoid}
+ .pd-sign div{border-top:1px solid #000;padding-top:4px;text-align:center;font-size:9.5pt}
+ .pd-bar{text-align:center;margin-top:16px;break-inside:avoid}.pd-bar svg{max-width:78mm;height:auto}
+ .pd-disc{font-size:8.8pt;border:1px solid #000;padding:6px 9px;margin-top:10px;text-align:justify}
+ .pd-foot{position:fixed;bottom:-14mm;left:0;right:0;font-size:8pt;border-top:1px solid #000;padding-top:2px;text-align:center}
+}
 </style>
 <!--HARDEN-->
 </head>
@@ -1408,24 +1546,20 @@ main{margin-left:var(--side-nav);transition:margin-left .25s}
 <header class="nav"><div class="nav-in">
   <a class="brand" href="#/" aria-label="AmarBhumi"><img class="logo logo-light" src="/assets/logo.png" alt="AmarBhumi আমার ভূমি"><img class="logo logo-dark" src="/assets/logo_dark.png" alt="AmarBhumi আমার ভূমি"></a>
   <div class="tools">
-    <span class="avatar" aria-hidden="true">U</span>
-    <div class="seg" id="roleSeg"><button data-role="user" data-i18n="role_user"></button><button data-role="admin" data-i18n="role_admin"></button></div>
+    
+    <div class="seg" id="roleSeg" hidden></div>
     <span class="mode-label" data-i18n="mode_label"></span><div class="seg modeSeg"><button data-mode="dataset" data-i18n="mode_dataset"></button><button data-mode="api" data-i18n="mode_api"></button></div>
     <div class="seg" id="langSeg"><button data-lang="bn">বাং</button><button data-lang="en">EN</button></div>
-    <button class="icon" id="themeBtn" title="Theme" aria-label="Theme"><i data-ic="contrast" data-s="18"></i></button>
+    <button class="icon" id="themeBtn" title="Theme" aria-label="Theme"><span id="themeIc"></span></button>
+    <div class="uwrap" id="userWrap" hidden><button class="ubtn" id="userBtn" aria-haspopup="true"><span class="avatar" id="uav"></span><span class="uname" id="uname"></span><i data-ic="chev" data-s="16"></i></button><div class="umenu" id="umenu" hidden></div></div>
     <button class="icon burger" id="burger" aria-label="Menu" aria-expanded="true"><i data-ic="menu" data-s="18"></i></button>
   </div>
 </div></header>
 
-<nav class="nav-links open" id="links" aria-label="Primary navigation">
-    <a href="#/" data-r="home" data-i18n="nav_home"></a>
-    <a href="#/map" data-r="map" data-i18n="nav_map"></a>
-    <a href="#/verify" data-r="verify" data-i18n="nav_verify"></a>
-    <a href="#/track" data-r="track" data-i18n="nav_track"></a>
-    <a href="#/admin" data-r="admin" id="navAdmin" data-i18n="nav_admin"></a>
-</nav>
+<nav class="nav-links open" id="links" aria-label="Primary navigation"></nav>
 
 <main>
+<section class="view" id="v-login" hidden></section>
 <section class="view" id="v-home">
   <div class="hero"><div class="container hero-in">
     <div>
@@ -1533,6 +1667,7 @@ main{margin-left:var(--side-nav);transition:margin-left .25s}
 
 <section class="view" id="v-admin" hidden><div class="container" id="a_root"></div></section>
 </main>
+<div id="printDoc"></div>
 <div id="loader" hidden><div class="card"><h3 id="ldTitle"></h3><div class="pbar"><i id="ldBar"></i></div><ul id="ldSteps"></ul><button class="btn sm alt" id="ldClose" hidden data-i18n="close"></button></div></div>
 <div id="toast"></div><dialog id="dlg"></dialog>
 
@@ -1566,7 +1701,7 @@ clipboard:'<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h
 clock:'<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
 ban:'<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>'};
 const ico=(n,s=18)=>`<svg class="ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[n]||''}</svg>`;
-let lang=localStorage.lang||'bn',role=localStorage.role||'user',dataMode=localStorage.dataMode==='dataset'?'dataset':'api';
+let lang=localStorage.lang||'bn',role='user',dataMode='api';
 /* ---------- translations [bn, en] ---------- */
 const T={
 brand:["আমার ভূমি","AmarBhumi"],tagline:["বাংলাদেশ ভূমি তথ্য ও যাচাই","Bangladesh land info & verification"],
@@ -1658,7 +1793,7 @@ const toast=m=>{const e=$('#toast');e.textContent=m;e.style.display='block';clea
 /* every request carries the active data mode -> server keeps the two modes isolated */
 const api=async(u,o={})=>{const h={...(o.headers||{}),'X-Data-Mode':dataMode};try{const k=sessionStorage.getItem('adminKey');if(k)h['X-Admin-Key']=k}catch(e){}
   const r=await fetch(u,{...o,headers:h});let j={};try{j=await r.json()}catch(e){}
-  if(r.status===401&&u.startsWith('/api/admin')&&!o._retry){const k=prompt(t('a_key'));if(k){try{sessionStorage.setItem('adminKey',k)}catch(e){}return api(u,{...o,_retry:1})}}
+  if(r.status===401&&!u.startsWith('/api/auth')&&ME){ME=null;route(false)}
   if(!r.ok)throw Object.assign(new Error(j.error||r.status),{status:r.status});return j};
 const PALETTE={'Commercial Area':'#e63946','Settlement':'#f4a261','Agriculture':'#8ab17d','Water Body':'#38bdf8','Road':'#9ca3af','Industrial Area':'#8b5cf6','Forest':'#15803d','Vacant Land':'#d6c28a'};
 const colorOf=c=>PALETTE[c]||`hsl(${[...(c||'?')].reduce((a,ch)=>a*31+ch.charCodeAt(0)>>>0,7)%360} 65% 50%)`;
@@ -1746,24 +1881,24 @@ function applyStatic(){document.documentElement.lang=lang;$$('[data-ic]').forEac
   $$('[data-i18n]').forEach(e=>e.textContent=t(e.dataset.i18n));$$('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
   $$('#langSeg button').forEach(b=>b.classList.toggle('on',b.dataset.lang===lang));$$('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.role===role));
   applyModeUI();$$('select').forEach(e=>{if(e._items&&e._ph){const v=e.value;fillApiSelect(e,e._items,e._ph);e.value=v}});
-  $('#navAdmin').style.display=role==='admin'?'':'none'}
+  if(typeof renderNav==='function'){renderNav();renderUser();syncThemeIcon()}}
 $('#langSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;lang=b.dataset.lang;localStorage.lang=lang;applyStatic();route(true)};
 $$('.modeSeg').forEach(sg=>sg.onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.mode!==dataMode)switchMode(b.dataset.mode)});
 $('#roleSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;role=b.dataset.role;localStorage.role=role;applyStatic();
   if(role==='admin'&&cur.path.indexOf('/admin')!==0)location.hash='#/admin';else if(role==='user'&&cur.path.indexOf('/admin')===0)location.hash='#/';else route(true)};
 function syncThemeLogo(theme){const dark=(theme||document.documentElement.dataset.theme)==='dark';const s=document.querySelector('.brand > img:only-child');if(s)s.src=dark?'/assets/logo_dark.png':'/assets/logo.png'}
-$('#themeBtn').onclick=()=>{const n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.theme=n;syncThemeLogo(n)};
+$('#themeBtn').onclick=()=>{const n=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=n;localStorage.theme=n;syncThemeLogo(n);syncThemeIcon()};
 syncThemeLogo();
 $('#burger').onclick=()=>{const collapsed=document.body.classList.toggle('side-nav-collapsed');$('#burger').setAttribute('aria-expanded',String(!collapsed))};
-$$('[data-go]').forEach(e=>e.onclick=()=>{const g=e.dataset.go;if(g==='#/admin'&&role!=='admin'){role='admin';localStorage.role=role;applyStatic()}location.hash=g});
+$$('[data-go]').forEach(e=>e.onclick=()=>{const g=e.dataset.go;if(g==='#/admin'&&role!=='admin')return toast(t('a_gate_t'));location.hash=g});
 
 /* ---------- router ---------- */
 function route(keep){
   const h=location.hash.slice(1)||'/',[path,qs]=h.split('?');cur={path,q:new URLSearchParams(qs||'')};
-  const v=path.startsWith('/map')?'map':path.startsWith('/verify')?'verify':path.startsWith('/track')?'track':path.startsWith('/admin')?'admin':'home';
+  const v=!ME?'login':path.startsWith('/map')?'map':path.startsWith('/verify')?'verify':path.startsWith('/track')?'track':path.startsWith('/admin')?'admin':'home';
   $$('.view').forEach(e=>e.hidden=e.id!=='v-'+v);document.body.classList.toggle('map-mode',v==='map');
-  $$('.nav-links a').forEach(a=>a.classList.toggle('on',a.dataset.r===v));
-  if(v==='home')renderHome();else if(v==='map')showMap(cur.q,keep);else if(v==='verify')renderVerify(keep);else if(v==='track')renderTrack(keep);else renderAdmin();
+  document.body.classList.toggle('auth-mode',v==='login');$$('.nav-links a').forEach(a=>{const ad=a.dataset.r==='admin';a.classList.toggle('on',ad?(v==='admin'&&a.dataset.h.endsWith('tab='+(cur.q.get('tab')||atab||'overview'))):a.dataset.r===v)});
+  if(v==='login')renderLogin();else if(v==='home')renderHome();else if(v==='map')showMap(cur.q,keep);else if(v==='verify')renderVerify(keep);else if(v==='track')renderTrack(keep);else renderAdmin();
   if(!keep&&v!=='map')scrollTo(0,0)}
 addEventListener('hashchange',()=>route(false));
 
@@ -1921,7 +2056,7 @@ async function geocode(q){
 function locateMe(){if(!navigator.geolocation)return;toast(t('m_locating'));
   navigator.geolocation.getCurrentPosition(p=>{const ll=[p.coords.latitude,p.coords.longitude];if(pinMark)map.removeLayer(pinMark);pinMark=L.circleMarker(ll,{radius:9,color:'#fff',weight:3,fillColor:'#2563eb',fillOpacity:1}).addTo(map).bindPopup(t('m_here')).openPopup();map.setView(ll,17)},e=>toast(e.message),{enableHighAccuracy:true,timeout:10000})}
 let sigSeen=null;
-async function poll(){if(!mapReady||!$('#auto').checked||$('#loader').hidden===false)return;const mode=dataMode;
+async function poll(){if(!ME||!mapReady||!$('#auto').checked||$('#loader').hidden===false)return;const mode=dataMode;
   try{const s=(await api('/api/version')).sig;if(mode!==dataMode)return;
     if(sigSeen&&s!==sigSeen){DSL=await api('/api/datasets');STATS=await api('/api/stats');
       cascade($('#m_dist'),$('#m_sheet'),true,()=>{});
@@ -1949,7 +2084,7 @@ function drawReport(){const r=VR;if(!r)return;
   $('#v_out').innerHTML=`
   <div class="vbanner ${r.verdict}"><div class="gauge" style="--p:${r.score}"><b>${nf(r.score,0)}</b><small>${t('v_score')}</small></div>
     <div><h2>${t(vt)}</h2><p>${t('v_plot')} ${X(r.label)} · ${esc(nm(r.district))} · ${X(r.mouza)}${r.source==='api'?'':' · '+t('f_sheet')+' '+X(r.sheet)}</p>
-    <div class="btnrow"><button class="btn sm alt" onclick="print()">${ico('printer',15)} ${t('v_print')}</button><a class="btn sm alt" href="#/map?ds=${encodeURIComponent(r.ds)}&plot=${encodeURIComponent(r.plot_no)}">${ico('map',15)} ${t('open_map')}</a></div></div></div>
+    <div class="btnrow"><button class="btn sm alt" onclick="printReport()">${ico('printer',15)} ${t('v_print')}</button><a class="btn sm alt" href="#/map?ds=${encodeURIComponent(r.ds)}&plot=${encodeURIComponent(r.plot_no)}">${ico('map',15)} ${t('open_map')}</a></div></div></div>
   <div class="vgrid">
    <div class="card"><h3>${t('v_status')}</h3>${r.checks.map(c=>`<div class="ck ${c.level}"><i>${ic[c.level]}</i><span>${t('ck_'+c.key)}</span><em>${t('lv_'+c.level)}</em></div>`).join('')}</div>
    <div class="card"><h3>${t('v_owner_h')}</h3><dl class="kv">
@@ -1991,16 +2126,16 @@ function drawTrack(){const c=TC;if(!c)return;
 /* ---------- admin ---------- */
 let atab='overview',FA=[],fType='',fStat='',WC=[];
 function renderAdmin(){
-  const root=$('#a_root');
+  const root=$('#a_root');atab=cur.q.get('tab')||atab;
   if(role!=='admin'){root.innerHTML=`<div class="phead"><div class="card empty" style="padding:40px"><h2>${ico('lock',22)} ${t('a_gate_t')}</h2><p>${t('a_gate_d')}</p><button class="btn" id="a_en">${t('a_enable')}</button></div></div>`;
-    $('#a_en').onclick=()=>{role='admin';localStorage.role=role;applyStatic();renderAdmin()};return}
+    $('#a_en').onclick=()=>toggleUmenu(true);return}
   root.innerHTML=`<div class="phead"><h1>${t('a_title')} <span class="badge ${dataMode==='api'?'ok':''}" style="vertical-align:middle">${dataMode==='api'?t('mode_api'):t('mode_dataset')}</span></h1><p><span class="note">${t('a_note')}</span></p></div>
   <div class="tabs">${[['overview','a_overview'],['fraud','a_fraud'],['workflow','a_workflow'],['data','a_data']].map(([k,l])=>`<button data-tab="${k}" class="${k===atab?'on':''}">${t(l)}</button>`).join('')}</div><div id="a_body"><div class="empty">${t('loading')}</div></div>`;
-  $$('.tabs button').forEach(b=>b.onclick=()=>{atab=b.dataset.tab;renderAdmin()});
+  $$('.tabs button').forEach(b=>b.onclick=()=>{location.hash='#/admin?tab='+b.dataset.tab});
   ({overview:aOverview,fraud:aFraud,workflow:aWorkflow,data:aData})[atab]().catch(e=>$('#a_body').innerHTML=`<div class="card empty">${esc(e.message)}</div>`)}
 const bars=(rows)=>{const m=Math.max(1,...rows.map(r=>r[1]));return rows.map(([l,v])=>`<div class="bar"><span>${l}</span><div><i style="width:${v/m*100}%"></i></div><b>${nf(v,0)}</b></div>`).join('')};
 async function aOverview(){const o=await api('/api/admin/overview');
-  $('#a_body').innerHTML=`<div class="kpis">${[['a_open',o.open_alerts],['a_high',o.high],['a_prog',o.in_progress],['a_flag',o.flagged],['a_avg',o.avg_days]].map(([k,v])=>`<div class="kpi"><b>${nf(v,0)}</b><span>${t(k)}</span></div>`).join('')}</div>
+  $('#a_body').innerHTML=`<div class="kpis">${[['a_open',o.open_alerts],['a_high',o.high],['a_prog',o.in_progress],['a_flag',o.flagged],['a_avg',o.avg_days],['stat_plots',STATS.plots],['stat_ds',STATS.datasets]].map(([k,v])=>`<div class="kpi"><b>${nf(v,0)}</b><span>${t(k)}</span></div>`).join('')}</div>
   <div class="two"><div class="card"><h3>${t('a_bytype')}</h3>${bars(FT.map(f=>[t('ft_'+f),o.by_type[f]||0]))}</div>
   <div class="card"><h3>${t('a_funnel')}</h3>${bars(STAGES.map((s,i)=>[t('sg_'+s),o.by_stage[i]]))}</div></div>
   <div class="card" style="margin-top:16px"><h3>${t('a_recent')}</h3>${o.recent.map(a=>`<div class="item"><span class="badge ${a.severity}">${t('sev_'+a.severity)}</span> <b>${t('ft_'+a.type)}</b> · ${a.id} · ${t('v_plot')} ${X(a.label)} · ${esc(nm(a.district))} <span class="badge ${a.status}" style="float:right">${t('st_'+a.status)}</span></div>`).join('')||`<div class="empty">${t('m_none')}</div>`}</div>`}
@@ -2068,7 +2203,7 @@ function openCreate(kind,pre={}){
     $('#n_go').disabled=true;
     try{await api(isF?'/api/admin/fraud':'/api/admin/workflow',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
       d.close();toast(t('a_created'));STATS=await api('/api/stats');
-      if(cur.path.startsWith('/admin')){atab=isF?'fraud':'workflow';renderAdmin()}}
+      if(cur.path.startsWith('/admin')){goto('#/admin?tab='+(isF?'fraud':'workflow'))}}
     catch(e){toast(e.message);$('#n_go').disabled=false}};
   if(!d.open)d.showModal()}
 async function aData(){const L=await api('/api/datasets'),isApi=dataMode==='api';
@@ -2090,8 +2225,107 @@ async function aData(){const L=await api('/api/datasets'),isApi=dataMode==='api'
     if(!fs.length)return toast(t('a_pick'));try{for(const[k,f]of fs)await api(`/api/admin/upload/${encodeURIComponent(n)}/${k}`,{method:'POST',body:await f.text()});toast(t('a_uploaded'));await refreshData();aData()}catch(e){toast(e.message)}}}
 
 /* ---------- boot ---------- */
-(async()=>{applyStatic();
-  try{await refreshData()}catch(e){toast(e.message)}
+/* ================= v3: auth, nav, theme icon, legal print ================= */
+Object.assign(IC,{
+sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+moon:'<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+dash:'<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+chev:'<path d="m6 9 6 6 6-6"/>',
+refresh:'<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+logout:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/>',
+swap:'<path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/>'});
+Object.assign(T,{
+role_user:["নাগরিক","Citizen"],ng_services:["সেবা","Services"],ng_admin:["প্রশাসন","Administration"],
+lg_title:["স্বাগতম","Welcome"],lg_sub:["চালিয়ে যেতে সাইন ইন করুন","Sign in to continue"],lg_or:["অথবা","or"],lg_google:["Google দিয়ে চালিয়ে যান","Continue with Google"],
+lg_google_off:["GOOGLE_CLIENT_ID সেট করা নেই — Google লগইন চালু করতে সেট করুন","GOOGLE_CLIENT_ID is not set — set it to enable Google sign-in"],
+lg_judge:["জাজ কুইক লগইন","Judge quick login"],lg_pick:["একটি ডেমো অ্যাকাউন্ট বেছে নিন","Pick a demo account"],lg_cred:["ডেমো ক্রেডেনশিয়াল","Demo credential"],lg_signin:["সাইন ইন","Sign in"],
+lg_logout:["লগআউট","Log out"],lg_admins:["অ্যাডমিন অ্যাকাউন্ট (দ্রুত পরিবর্তন)","Admin accounts (quick switch)"],lg_users:["নাগরিক অ্যাকাউন্ট","Citizen accounts"],
+a_gate_d:["অ্যাডমিন টুল দেখতে একটি অ্যাডমিন অ্যাকাউন্টে যান।","Switch to an admin account to open the admin tools."],a_enable:["অ্যাকাউন্ট পরিবর্তন","Switch account"],
+a_note:["অ্যাডমিন কনসোল — শুধু অনুমোদিত ব্যবহারকারী","Admin console — authorised users only"],
+pr_title:["ভূমি যাচাই প্রতিবেদন","Land Verification Report"],pr_subt:["আমার ভূমি — ডিজিটাল ভূমি যাচাই সেবা (ডেমো)","AmarBhumi — Digital Land Verification Service (demo)"],
+pr_ref:["প্রতিবেদন নং","Report no."],pr_issued:["প্রস্তুতের তারিখ","Date of issue"],pr_for:["অনুরোধকারী","Requested by"],pr_scan:["QR স্ক্যান করে হালনাগাদ অবস্থা যাচাই করুন","Scan the QR code to check the latest status"],
+pr_s1:["ভূমির পরিচিতি ও অবস্থান","Land identification & location"],pr_s2:["রেকর্ডীয় মালিকানার বিবরণ","Record ownership particulars"],pr_s3:["ভূমির শ্রেণি ও ব্যবহার","Land classification & use"],
+pr_s4:["স্বয়ংক্রিয় যাচাই ও ঝুঁকি নিরূপণ","Automated checks & risk assessment"],pr_s5:["মামলা, দায় ও বিশেষ অবস্থা","Cases, liabilities & special status"],pr_s6:["জালিয়াতি সংক্রান্ত সংকেত","Fraud indicators"],
+pr_s7:["হস্তান্তর ও নামজারির ধারাবাহিক ইতিহাস","Chronology of transfers & mutations"],pr_s8:["মতামত ও সুপারিশ","Opinion & recommendations"],
+pr_date:["তারিখ","Date"],pr_nature:["প্রকৃতি","Nature"],pr_parties:["পক্ষসমূহ (হস্তান্তরকারী → গ্রহীতা)","Parties (transferor → transferee)"],pr_chk:["যাচাইয়ের বিষয়","Check"],pr_res:["ফলাফল","Result"],pr_cls:["শ্রেণি","Class"],pr_use:["ব্যবহার","Use"],
+pr_decl:["এতদ্বারা প্রত্যয়ন করা যাইতেছে যে, উপর্যুক্ত দাগের ভূমি সম্পর্কে সরকারি ভূমি মানচিত্র সেবা হইতে প্রাপ্ত জ্যামিতিক তথ্য এবং এই প্ল্যাটফর্মের যাচাই ইঞ্জিনের বিশ্লেষণের ভিত্তিতে এই প্রতিবেদন প্রস্তুত করা হইয়াছে। প্রতিবেদনে উল্লিখিত তথ্য প্রস্তুতের তারিখ পর্যন্ত হালনাগাদ।","It is hereby certified that this report has been prepared on the basis of geometric data obtained from the government land-map service and the analysis of this platform's verification engine in respect of the plot described above. The particulars stated are current as of the date of issue."],
+pr_disc:["দ্রষ্টব্য: এই প্রতিবেদন কেবল তথ্যগত সহায়তার জন্য প্রদত্ত; ইহা মালিকানার চূড়ান্ত প্রমাণ, খতিয়ান, পর্চা বা আদালতে গ্রহণযোগ্য দলিল নহে। মালিকানা, মামলা ও জালিয়াতি সংক্রান্ত তথ্য এই MVP-তে কাল্পনিক (ডেমো)। কোনো লেনদেনের পূর্বে ইউনিয়ন ভূমি অফিস ও সাব-রেজিস্ট্রি অফিস হইতে মূল রেকর্ড যাচাই করুন।","Note: This report is provided for information only and is not conclusive proof of title, a khatian, a porcha or a document admissible in court. Ownership, case and fraud particulars in this MVP are fictional (demo). Verify original records at the union land office and sub-registry office before any transaction."],
+pr_sig1:["প্রস্তুতকারী: আমার ভূমি যাচাই ইঞ্জিন (স্বয়ংক্রিয়)","Prepared by: AmarBhumi verification engine (automated)"],pr_sig2:["যাচাইকারী কর্মকর্তার স্বাক্ষর ও সিল","Signature & seal of verifying officer"],pr_pg:["অনলাইনে যাচাই:","Verify online:"]});
+let ME=null,CFG={},JSEL=null;
+const post=async(u,b)=>{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j};
+async function loadMe(){try{CFG=await (await fetch('/api/auth/me')).json();ME=CFG.user||null;role=ME?ME.role:'user'}catch(e){ME=null}}
+function syncThemeIcon(){const e=$('#themeIc');if(e)e.innerHTML=ico(document.documentElement.dataset.theme==='dark'?'moon':'sun',18)}
+const avatarOf=u=>u.picture?`<img src="${esc(u.picture)}" alt="" referrerpolicy="no-referrer">`:esc((nm(u.name)||'U').trim().charAt(0));
+function renderNav(){const el=$('#links');if(!el)return;if(!ME){el.innerHTML='';return}
+  const g=(k,items)=>`<div class="ngrp">${t(k)}</div>`+items.map(([h,r,i,l])=>`<a href="${h}" data-r="${r}" data-h="${h}">${ico(i,18)}<span>${t(l)}</span></a>`).join('');
+  el.innerHTML=g('ng_services',[['#/','home','leaf','nav_home'],['#/map','map','map','nav_map'],['#/verify','verify','search','nav_verify'],['#/track','track','file','nav_track']])
+   +(role==='admin'?g('ng_admin',[['#/admin?tab=overview','admin','dash','a_overview'],['#/admin?tab=fraud','admin','shield','a_fraud'],['#/admin?tab=workflow','admin','clipboard','a_workflow'],['#/admin?tab=data','admin','layers','a_data']]):'')
+   +`<div class="nfoot"><span class="avatar">${avatarOf(ME)}</span><span><b>${esc(nm(ME.name))}</b><span class="badge ${role==='admin'?'ok':''}">${t('role_'+role)}</span></span></div>`}
+function toggleUmenu(v){const m=$('#umenu');if(m)m.hidden=v===undefined?!m.hidden:!v}
+function renderUser(){const w=$('#userWrap');if(!w)return;w.hidden=!ME;if(!ME)return;
+  $('#uav').innerHTML=avatarOf(ME);$('#uname').textContent=nm(ME.name);
+  const row=u=>`<button class="urow ${u.id===ME.id?'on':''}" data-sw="${u.id}"><span class="avatar">${avatarOf(u)}</span><span><b>${esc(nm(u.name))}</b><small>${esc(nm(u.title))}</small></span></button>`,demo=CFG.demo||[];
+  $('#umenu').innerHTML=`<div class="urow" style="cursor:default"><span class="avatar">${avatarOf(ME)}</span><span><b>${esc(nm(ME.name))}</b><small>${esc(ME.email)}</small></span><span class="badge ${role==='admin'?'ok':''}">${t('role_'+role)}</span></div>`
+   +(CFG.judge?`<h5>${t('lg_admins')}</h5>${demo.filter(u=>u.role==='admin').map(row).join('')}<h5>${t('lg_users')}</h5>${demo.filter(u=>u.role!=='admin').map(row).join('')}`:'')
+   +`<h5></h5><button class="urow" id="lout">${ico('logout',16)} ${t('lg_logout')}</button>`}
+$('#userBtn').onclick=e=>{e.stopPropagation();toggleUmenu()};
+document.addEventListener('click',e=>{if(!e.target.closest('#userWrap'))toggleUmenu(false)});
+$('#umenu').onclick=async e=>{const b=e.target.closest('[data-sw]');
+  if(b){if(b.dataset.sw===ME.id)return;try{const j=await post('/api/auth/switch',{id:b.dataset.sw});ME=j.user;role=ME.role;toggleUmenu(false);
+    if(role!=='admin'&&cur.path.startsWith('/admin'))location.hash='#/';await switchMode('api');applyStatic();toast(nm(ME.name)+' · '+t('role_'+role))}catch(er){toast(er.message)}return}
+  if(e.target.closest('#lout')){await post('/api/auth/logout').catch(()=>{});ME=null;CFG.judge=false;toggleUmenu(false);try{google.accounts.id.disableAutoSelect()}catch(x){}applyStatic();route(false)}};
+async function enter(j){ME=j.user;CFG.judge=j.judge;role=ME.role;try{await refreshData()}catch(e){}applyStatic();goto('#/')}
+const GIC='<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3A12 12 0 1 1 24 12c3 0 5.8 1.1 7.9 3l5.7-5.7A20 20 0 1 0 44 24c0-1.3-.1-2.7-.4-3.9z"/><path fill="#FF3D00" d="m6.3 14.7 6.6 4.8A12 12 0 0 1 24 12c3 0 5.8 1.1 7.9 3l5.7-5.7A20 20 0 0 0 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2A12 12 0 0 1 12.7 28l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3a12 12 0 0 1-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.7-.4-3.9z"/></svg>';
+function gisInit(){if(!window.google||!google.accounts)return setTimeout(gisInit,300);
+  google.accounts.id.initialize({client_id:CFG.google_client_id,callback:async r=>{try{await enter(await post('/api/auth/google',{credential:r.credential}))}catch(e){toast(e.message)}}});
+  google.accounts.id.renderButton($('#gbtn'),{theme:'outline',size:'large',width:360,text:'continue_with',locale:lang==='bn'?'bn':'en'})}
+async function renderLogin(){
+  try{CFG=await (await fetch('/api/auth/me')).json()}catch(e){}
+  const demo=CFG.demo||[];JSEL=null;
+  $('#v-login').innerHTML=`<div class="login"><div class="login-art"><span class="pill">${t('hero_badge')}</span><h1>${t('hero_h')}</h1><p>${t('hero_p')}</p></div>
+  <div class="login-wrap"><div class="card login-card"><div><img class="logo logo-light" src="/assets/logo.png" alt="AmarBhumi"><img class="logo logo-dark" src="/assets/logo_dark.png" alt="AmarBhumi"></div>
+   <div><h2>${t('lg_title')}</h2><p class="mu" style="margin:4px 0 0">${t('lg_sub')}</p></div>
+   <div id="gbtn">${CFG.google_client_id?'':`<button class="btn alt gdis" disabled>${GIC} ${t('lg_google')}</button><small class="mu">${t('lg_google_off')}</small>`}</div>
+   <div class="or"><span>${t('lg_or')}</span></div>
+   <button class="btn alt" id="jtoggle" style="width:100%">${ico('shield',16)} ${t('lg_judge')}</button>
+   <div id="jbox" hidden><p class="mu" style="margin:0 0 6px;font-size:13px">${t('lg_pick')}</p>
+    ${demo.map(u=>`<button class="urow" data-id="${u.id}"><span class="avatar">${avatarOf(u)}</span><span><b>${esc(nm(u.name))}</b><small>${esc(nm(u.title))}</small></span><span class="badge ${u.role==='admin'?'ok':''}">${t('role_'+u.role)}</span></button>`).join('')}
+    <div id="jcred" class="item" hidden style="margin-top:8px"></div><button class="btn" id="jgo" style="width:100%;margin-top:8px" disabled>${t('lg_signin')}</button></div></div></div></div>`;
+  if(CFG.google_client_id){if(!window.google){const s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.async=true;document.head.appendChild(s)}gisInit()}
+  $('#jtoggle').onclick=()=>$('#jbox').hidden=!$('#jbox').hidden;
+  $$('#jbox .urow').forEach(b=>b.onclick=()=>{JSEL=b.dataset.id;$$('#jbox .urow').forEach(x=>x.classList.toggle('on',x===b));const u=demo.find(x=>x.id===JSEL);
+    $('#jcred').hidden=false;$('#jcred').innerHTML=`${t('lg_cred')}<br><b>${esc(u.email)}</b> / <b>${esc(CFG.demo_password)}</b>`;$('#jgo').disabled=false});
+  $('#jgo').onclick=async()=>{try{await enter(await post('/api/auth/judge',{id:JSEL,password:CFG.demo_password}))}catch(e){toast(e.message)}}}
+
+/* ---------- A4 legal-style report with QR + Code128 barcode ---------- */
+const h32=s=>{let h=2166136261;for(const c of s){h^=c.charCodeAt(0);h=Math.imul(h,16777619)}return h>>>0};
+function qrSvg(x){try{const q=qrcode(0,'M');q.addData(x);q.make();return q.createSvgTag({cellSize:4,margin:0,scalable:true})}catch(e){return ''}}
+function barSvg(x){try{const s=document.createElementNS('http://www.w3.org/2000/svg','svg');JsBarcode(s,x,{format:'CODE128',displayValue:true,height:46,width:1.7,margin:0,fontSize:13,background:'transparent'});return s.outerHTML}catch(e){return ''}}
+function printReport(){const r=VR;if(!r)return;
+  const now=new Date(),ref='AB-'+now.toISOString().slice(0,10).replace(/-/g,'')+'-'+String(h32(r.ds+'|'+r.plot_no)%1000000).padStart(6,'0');
+  const url=location.origin+'/#/verify?ds='+encodeURIComponent(r.ds)+'&plot='+encodeURIComponent(r.plot_no)+'&ref='+ref;
+  const dot=lang==='bn'?'।':'.',sec=(i,k,b)=>`<section class="pd-sec"><h3>${D(i)}${dot} ${t(k)}</h3>${b}</section>`,
+   kv=rows=>`<table class="pd-kv">${rows.map(([a,b])=>`<tr><th>${a}</th><td>${b}</td></tr>`).join('')}</table>`,
+   tb=(h,rows)=>`<table><thead><tr>${h.map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.map(c=>`<tr>${c.map(x=>`<td>${x}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+  const vt={safe:'v_verdict_safe',caution:'v_verdict_caution',danger:'v_verdict_danger'}[r.verdict];
+  $('#printDoc').innerHTML=`<div class="pd-foot">${t('pr_ref')}: ${esc(ref)} · ${t('pr_pg')} ${esc(url)}</div>
+  <header class="pd-head"><div><img src="/assets/logo.png" alt="" style="height:44px"><h1>${t('pr_title')}</h1><p>${t('pr_subt')}</p></div><div class="pd-qr">${qrSvg(url)}${t('pr_scan')}</div></header>
+  <div class="pd-meta"><div><b>${t('pr_ref')}</b>${esc(ref)}</div><div><b>${t('pr_issued')}</b>${fd(now)}</div><div><b>${t('pr_for')}</b>${esc(ME?nm(ME.name):'—')}</div></div>
+  ${sec(1,'pr_s1',kv([[t('f_district'),esc(nm(r.district))],[t('v_mouza'),`${X(r.mouza)} (${X(r.m_code)})`],['JL',X(r.jl||'—')],[t('v_dag'),X(r.dag)],[t('v_khatian'),X(r.khatian)],[t('v_area'),`${nf(dec(r.area_sqm))} ${t('u_dec')} · ${nf(r.area_sqm/4046.86,4)} ${t('u_acre')} · ${nf(r.area_sqm,0)} ${t('u_sqm')}`]]))}
+  ${sec(2,'pr_s2',kv([[t('v_owner'),esc(nm(r.owner))],[t('v_father'),esc(nm(r.father))],[t('v_nid'),X(r.nid)],[t('v_share'),X(r.share)]]))}
+  ${sec(3,'pr_s3',tb([t('pr_cls'),t('pr_use'),t('v_area')+' ('+t('u_dec')+')'],r.parts.length?r.parts.map(p=>[esc(cls(p.maj)),esc(sub(p.sub)),nf(dec(p.area_sqm),2)]):[['—','—','—']]))}
+  ${sec(4,'pr_s4',tb([t('pr_chk'),t('pr_res')],r.checks.map(c=>[t('ck_'+c.key),`<span class="pd-res">${t('lv_'+c.level)}</span>`]).concat([[t('v_score'),`<span class="pd-res">${nf(r.score,0)} / ${nf(100,0)} — ${t(vt)}</span>`]])))}
+  ${sec(5,'pr_s5',`<ol>${r.pending.map(p=>`<li>${t('p_'+p.type)} — ${X(p.ref)} (${t('fo_'+p.forum)}, ${t('v_since')} ${fd(p.since)})</li>`).join('')||`<li>${t('v_nopending')}</li>`}<li>${t('kh_'+r.khas)}</li><li>${t('aq_'+r.acq)}</li></ol>`)}
+  ${sec(6,'pr_s6',r.flags.length?`<ol>${r.flags.map(f=>`<li><b>${t('ft_'+f.type)}</b> (${t('sev_'+f.severity)}, ${nf(f.confidence,0)}%)<br>${f.evidence.map(e=>X(nm(e))).join('; ')}</li>`).join('')}</ol>`:`<p style="margin:0">${t('v_noflags')}</p>`)}
+  ${sec(7,'pr_s7',tb([t('pr_date'),t('pr_nature'),t('pr_parties'),t('v_deed')+' / '+t('v_case')],r.history.map(h=>[fd(h.date),t('h_'+h.type),`${esc(nm(h.from))} → ${esc(nm(h.to))}`,`${X(h.deed_no)} / ${X(h.case_no)}`])))}
+  ${sec(8,'pr_s8',`<ol>${r.advice.map(a=>`<li>${X(nm(a))}</li>`).join('')}</ol>`)}
+  <p class="pd-decl">${t('pr_decl')}</p>
+  <div class="pd-sign"><div>${t('pr_sig1')}</div><div>${t('pr_sig2')}</div></div>
+  <div class="pd-bar">${barSvg(ref)}</div><div class="pd-disc">${t('pr_disc')}</div>`;
+  setTimeout(()=>print(),200)}
+
+(async()=>{await loadMe();applyStatic();syncThemeIcon();
+  if(ME){try{await refreshData()}catch(e){toast(e.message)}}
   route(false)})();
 </script>
 </body>
