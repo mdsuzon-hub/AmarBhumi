@@ -19,6 +19,9 @@ TWO ISOLATED DATA MODES (header switch, X-Data-Mode sent by the front-end)
 
     Government service URL can be overridden with BD_MAP_URL.
 
+    Google Maps is the primary base map (Map Tiles API, proxied so the key stays server-side):
+    put GOOGLE_MAPS_API_KEY=... in .env. Leaflet/Esri is the automatic fallback.
+
 Roles (MVP, no login):  User = public pages.  Admin = switch in the header -> #/admin
 Ownership, cases, fraud alerts and mutation workflow are DUMMY data (deterministic).
 """
@@ -42,6 +45,32 @@ from datetime import date, timedelta
 from flask import Flask, Response, jsonify, redirect, request, has_request_context, send_file, session
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+def _load_env():
+    """Minimal .env reader (no extra dependency). Real environment variables win over .env."""
+    for folder in dict.fromkeys((BASE, os.getcwd())):
+        try:
+            with open(os.path.join(folder, ".env"), encoding="utf-8-sig") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k.startswith("export "):
+                        k = k[7:].strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    elif " #" in v:
+                        v = v.split(" #", 1)[0].strip()
+                    if k:
+                        os.environ.setdefault(k, v)
+        except OSError:
+            pass
+
+
+_load_env()
+
+
 DATA_DIR = os.path.join(BASE, "data")
 API_DIR = os.path.join(DATA_DIR, "api")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -643,6 +672,96 @@ def record(key):
 # ----------------------------------------------------------------- API
 def err(msg, code=400):
     return jsonify(error=msg), code
+
+
+# ----------------------------------------------------------------- Google Maps (Map Tiles API) proxy
+# The key never reaches the browser: tiles are fetched server-side through /api/gtile/... (login required).
+# Enable "Map Tiles API" for the key in Google Cloud. If the key is missing or Google fails, the
+# front-end silently falls back to the Leaflet/Esri base maps.
+GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
+G_TYPES = {
+    "sat": {"mapType": "satellite"},
+    "hyb": {"mapType": "satellite", "layerTypes": ["layerRoadmap"]},
+    "road": {"mapType": "roadmap"},
+    "ter": {"mapType": "terrain", "layerTypes": ["layerRoadmap"]},
+    "traffic": {"mapType": "roadmap", "layerTypes": ["layerTraffic"], "overlay": True},
+}
+_g = {"sess": {}, "down": {}, "health": None, "lock": threading.Lock()}
+
+
+def _g_session(kind, lang, force=False):
+    key, now = (kind, lang), time.time()
+    with _g["lock"]:
+        s = _g["sess"].get(key)
+        if s and now < s["exp"] - 300 and not (force and now - s["at"] > 30):
+            return s["id"]
+        if now < _g["down"].get(key, 0):
+            raise RuntimeError("Google Map Tiles temporarily unavailable")
+    body = dict(G_TYPES[kind], language="bn-BD" if lang == "bn" else "en-US", region="BD")
+    req = urllib.request.Request(
+        "https://tile.googleapis.com/v1/createSession?key=" + urllib.parse.quote(GMAPS_KEY),
+        data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            j = json.loads(r.read().decode("utf-8"))
+        sid = j["session"]
+    except Exception as exc:
+        with _g["lock"]:
+            _g["down"][key] = time.time() + 30  # do not hammer Google while it is failing
+        raise RuntimeError(f"Google session failed: {exc}") from exc
+    try:
+        exp = int(j.get("expiry") or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    with _g["lock"]:
+        _g["sess"][key] = {"id": sid, "exp": exp or now + 3600, "at": now}
+    return sid
+
+
+def _g_health(force=False):
+    if not GMAPS_KEY:
+        return False
+    now, c = time.time(), _g["health"]
+    if not force and c and now - c[0] < (300 if c[1] else 45):
+        return c[1]
+    if force:
+        with _g["lock"]:
+            _g["down"].clear()
+    try:
+        _g_session("sat", "en-US", force=force)
+        ok = True
+    except RuntimeError:
+        ok = False
+    _g["health"] = (time.time(), ok)
+    return ok
+
+
+@app.route("/api/gmaps/config")
+def api_gmaps_config():
+    return jsonify(configured=bool(GMAPS_KEY), enabled=_g_health(request.args.get("recheck") == "1"), types=sorted(G_TYPES))
+
+
+@app.route("/api/gtile/<kind>/<int:z>/<int:x>/<int:y>")
+def api_gtile(kind, z, x, y):
+    if not GMAPS_KEY or kind not in G_TYPES or not 0 <= z <= 22 or not (0 <= x < 2 ** z and 0 <= y < 2 ** z):
+        return Response(status=404)
+    lang = "bn" if request.args.get("l") == "bn" else "en"
+    for attempt in (0, 1):
+        try:
+            sid = _g_session(kind, lang, force=attempt == 1)
+            url = (f"https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}?session={urllib.parse.quote(sid)}"
+                   f"&key={urllib.parse.quote(GMAPS_KEY)}")
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "AmarBhumi/1.0"}), timeout=12) as r:
+                data, ctype, cc = r.read(), r.headers.get_content_type(), r.headers.get("Cache-Control")
+            # tiles are passed through, not stored: Google's terms only allow caching per its own headers
+            return Response(data, mimetype=ctype, headers={"Cache-Control": cc or "private, max-age=3600"})
+        except urllib.error.HTTPError as exc:
+            if exc.code in (400, 401, 403) and attempt == 0:
+                continue  # the session may have expired -> one retry with a fresh one
+            return Response(status=404 if exc.code == 404 else 502)
+        except (urllib.error.URLError, OSError, RuntimeError, ValueError):
+            return Response(status=502)
+    return Response(status=502)
 
 
 JUDGE_PW = "judge@2026"
@@ -1541,6 +1660,41 @@ body.auth-mode main{margin-left:0}
  .pd-bar{text-align:center;margin-top:16px;break-inside:avoid}.pd-bar svg{max-width:78mm;height:auto}
  .pd-disc{font-size:8.8pt;border:1px solid #000;padding:6px 9px;margin-top:10px;text-align:justify}
  }
+
+/* ===== v4: map layer picker + clean side-panel hide ===== */
+#v-map{overflow:hidden;--mapl:364px}
+#v-map.pclosed{--mapl:12px}
+#panel{transition:transform .25s ease,opacity .2s ease,visibility 0s}
+#panel.hide{transform:translateX(calc(-100% - 24px));opacity:0;visibility:hidden;pointer-events:none;transition:transform .25s ease,opacity .2s ease,visibility 0s linear .25s}
+#ptoggle{left:var(--mapl);transition:left .25s}
+#v-map .leaflet-bottom.leaflet-left{left:calc(var(--mapl) + 66px);transition:left .25s}
+.thumb{position:relative;display:block;overflow:hidden;background:var(--sf2)}
+.thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#lyBtn{position:absolute;z-index:1001;left:var(--mapl);bottom:28px;width:62px;padding:0;overflow:hidden;border:2px solid #fff;border-radius:12px;background:var(--sf);color:var(--tx);font:inherit;cursor:pointer;box-shadow:var(--sh);transition:left .25s,transform .15s}
+#lyBtn:hover{transform:translateY(-2px)}
+#lyBtn .thumb{height:44px}
+#lyBtn .lb{display:block;padding:2px 0 3px;font-size:11px;font-weight:600;line-height:1.4;text-align:center;background:var(--sf)}
+#lyPop{position:absolute;z-index:1002;left:var(--mapl);bottom:104px;width:min(420px,calc(100% - 24px));max-height:calc(100% - 140px);overflow:auto;background:var(--glass);backdrop-filter:blur(12px);border:1px solid var(--ln);border-radius:18px;box-shadow:var(--sh);padding:14px;transition:left .25s}
+.lp-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}.lp-head b{font-size:16px}
+#lyPop h5{margin:14px 0 8px;font-size:11.5px;color:var(--mu);font-weight:700}
+.lp-st{font-size:12.5px;border-radius:10px;padding:7px 10px}
+.lp-st.ok{background:var(--gt);color:var(--g)}.lp-st.warn{background:var(--wrt);color:var(--wr)}
+.lp-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.lp-card{border:2px solid transparent;background:var(--sf2);border-radius:12px;padding:0;overflow:hidden;color:var(--tx);font:inherit;text-align:center;cursor:pointer;transition:.15s}
+.lp-card:hover{border-color:var(--ln)}
+.lp-card .thumb{height:56px}
+.lp-card .n{display:block;padding:4px 2px 5px;font-size:12px;font-weight:600;line-height:1.3}
+.lp-card.on{border-color:var(--g)}.lp-card.on .n{color:var(--g)}
+.lp-card.dis{opacity:.45;cursor:not-allowed}
+@media(max-width:760px){
+ #v-map,#v-map.pclosed{--mapl:12px}
+ #panel.hide{transform:translateY(calc(-100% - 24px))}
+ #ptoggle{left:auto}
+ #lyBtn{bottom:auto;top:calc(46% + 24px)}
+ #drawer:not([hidden])~#lyBtn{display:none}
+ #lyPop{bottom:12px;top:auto;max-height:70%}
+ #v-map .leaflet-bottom.leaflet-left{left:0}
+}
 </style>
 <!--HARDEN-->
 </head>
@@ -1641,12 +1795,14 @@ body.auth-mode main{margin-left:0}
       <label class="chk"><input type="checkbox" id="autoload" checked><span data-i18n="m_autoload"></span></label>
       <label class="chk"><input type="checkbox" id="auto" checked><span data-i18n="m_auto"></span></label>
       <h4 data-i18n="m_opacity"></h4><input id="op" type="range" min="0" max="1" step="0.05" value="0.55">
-      <h4 data-i18n="m_base"></h4><div class="chips" id="bases"></div>
+      
     </div>
   </aside>
-  <button class="icon" id="ptoggle" aria-label="Panel"><i data-ic="layers" data-s="18"></i></button>
+  <button class="icon" id="ptoggle" aria-label="Panel" aria-expanded="true"><i data-ic="panel" data-s="18"></i></button>
   <div class="fabs"><button class="icon" id="locate" title="My location" aria-label="My location"><i data-ic="locate" data-s="18"></i></button></div>
   <div id="drawer" hidden></div>
+  <button class="lybtn" id="lyBtn" aria-haspopup="dialog" aria-label="Layers"></button>
+  <div id="lyPop" role="dialog" hidden></div>
 </section>
 
 <section class="view" id="v-verify" hidden><div class="container">
@@ -1885,7 +2041,7 @@ function applyStatic(){document.documentElement.lang=lang;$$('[data-ic]').forEac
   $$('#langSeg button').forEach(b=>b.classList.toggle('on',b.dataset.lang===lang));$$('#roleSeg button').forEach(b=>b.classList.toggle('on',b.dataset.role===role));
   applyModeUI();$$('select').forEach(e=>{if(e._items&&e._ph){const v=e.value;fillApiSelect(e,e._items,e._ph);e.value=v}});
   if(typeof renderNav==='function'){renderNav();renderUser();syncThemeIcon()}}
-$('#langSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;lang=b.dataset.lang;localStorage.lang=lang;applyStatic();route(true)};
+$('#langSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;lang=b.dataset.lang;localStorage.lang=lang;applyStatic();if(mapReady)setBase(baseKey,false);route(true)};
 $$('.modeSeg').forEach(sg=>sg.onclick=e=>{const b=e.target.closest('button');if(b&&b.dataset.mode!==dataMode)switchMode(b.dataset.mode)});
 $('#roleSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;role=b.dataset.role;localStorage.role=role;applyStatic();
   if(role==='admin'&&cur.path.indexOf('/admin')!==0)location.hash='#/admin';else if(role==='user'&&cur.path.indexOf('/admin')===0)location.hash='#/';else route(true)};
@@ -1925,32 +2081,85 @@ const goPlace=()=>{const v=$('#h_place').value.trim();if(v)goto('#/map?place='+e
 $('#h_go').onclick=goPlace;$('#h_place').onkeydown=e=>{if(e.key==='Enter')goPlace()};
 
 /* ---------- map ---------- */
-let map,landG,plotG,apiG,ovG,baseLayer,baseKey='satl',loaded=[],DATA=null,plotLayers={},selLayer=null,curSel=null,hiddenCls=new Set(),mapReady=false,pinMark=null,busy=false,searchT;
+let map,landG,plotG,apiG,ovG,baseLayer,baseKey=(()=>{try{return localStorage.base}catch(e){return null}})()||'g_sat',loaded=[],DATA=null,plotLayers={},selLayer=null,curSel=null,hiddenCls=new Set(),mapReady=false,pinMark=null,busy=false,searchT;
 const esri='https://server.arcgisonline.com/ArcGIS/rest/services/';
+let GCFG=null,GP=null,gBusy=false,trafficOn=false,trafficL=null;
+/* ---- Google tiles are fetched through our own proxy (/api/gtile) so the API key stays on the server ---- */
+const GT=k=>`/api/gtile/${k}/{z}/{x}/{y}?l=${lang}`;
+const gl=(k,onFail)=>{const l=L.tileLayer(GT(k),{maxNativeZoom:20,maxZoom:22,attribution:'Map data © Google'});let ok=0,bad=0,strikes=0;
+  l.on('tileload',()=>ok++);
+  l.on('tileerror',()=>{bad++;if(onFail&&bad>=5&&bad>ok){bad=0;ok=0;strikes++;onFail(strikes>=2)}});return l};
+const tl=(u,o)=>L.tileLayer(u,o);
 const BASES={
- sat:()=>L.tileLayer(esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:19,maxZoom:22,attribution:'Tiles © Esri'}),
- satl:()=>L.layerGroup([BASES.sat(),L.tileLayer(esri+'Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:19,maxZoom:22})]),
- osm:()=>L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxNativeZoom:19,maxZoom:22,attribution:'© OpenStreetMap contributors'}),
- topo:()=>L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{maxNativeZoom:17,maxZoom:22,attribution:'© OpenTopoMap, OSM'}),
- light:()=>L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{maxNativeZoom:20,maxZoom:22,attribution:'© OSM, © CARTO'}),
- dark:()=>L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxNativeZoom:20,maxZoom:22,attribution:'© OSM, © CARTO'})};
-const PIN_COLORS={sat:'#ff453a',satl:'#ff453a',osm:'#2563eb',topo:'#7c3aed',light:'#e11d48',dark:'#22d3ee'};
+ g_sat:{g:1,pv:()=>[GT('sat')],make:f=>gl('sat',f)},
+ g_hyb:{g:1,pv:()=>[GT('hyb')],make:f=>gl('hyb',f)},
+ g_road:{g:1,pv:()=>[GT('road')],make:f=>gl('road',f)},
+ g_ter:{g:1,pv:()=>[GT('ter')],make:f=>gl('ter',f)},
+ satl:{pv:()=>[esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',esri+'Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}'],
+   make:()=>L.layerGroup([tl(esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:19,maxZoom:22,attribution:'Tiles © Esri'}),tl(esri+'Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:19,maxZoom:22})])},
+ sat:{pv:()=>[esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}'],make:()=>tl(esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:19,maxZoom:22,attribution:'Tiles © Esri'})},
+ osm:{pv:()=>['https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'],make:()=>tl('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxNativeZoom:19,maxZoom:22,attribution:'© OpenStreetMap contributors'})},
+ topo:{pv:()=>['https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png'],make:()=>tl('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{maxNativeZoom:17,maxZoom:22,attribution:'© OpenTopoMap, OSM'})},
+ light:{pv:()=>['https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'],make:()=>tl('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{maxNativeZoom:20,maxZoom:22,attribution:'© OSM, © CARTO'})},
+ dark:{pv:()=>['https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'],make:()=>tl('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxNativeZoom:20,maxZoom:22,attribution:'© OSM, © CARTO'})}};
+const GKEYS=['g_sat','g_hyb','g_road','g_ter'],OKEYS=['satl','sat','osm','topo','light','dark'];
+const PIN_COLORS={g_sat:'#ff453a',g_hyb:'#ff453a',g_road:'#2563eb',g_ter:'#7c3aed',sat:'#ff453a',satl:'#ff453a',osm:'#2563eb',topo:'#7c3aed',light:'#e11d48',dark:'#22d3ee'};
+/* Google is asked once per session whether it works (key present + Map Tiles API enabled); otherwise Leaflet/Esri takes over */
+function ensureG(){return GP||(GP=api('/api/gmaps/config').catch(()=>({configured:false,enabled:false})).then(c=>{GCFG=c;
+  if(!BASES[baseKey])baseKey='g_sat';if(!c.enabled&&BASES[baseKey].g)baseKey='satl';return c}))}
 function pinSvg(c,size){return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true"><path fill="${c}" fill-rule="evenodd" d="M18.364 17.364L12 23.7279L5.63604 17.364C2.12132 13.8492 2.12132 8.15076 5.63604 4.63604C9.15076 1.12132 14.8492 1.12132 18.364 4.63604C21.8787 8.15076 21.8787 13.8492 18.364 17.364ZM12 15C14.2091 15 16 13.2091 16 11C16 8.79086 14.2091 7 12 7C9.79086 7 8 8.79086 8 11C8 13.2091 9.79086 15 12 15ZM12 13C10.8954 13 10 12.1046 10 11C10 9.89543 10.8954 9 12 9C13.1046 9 14 9.89543 14 11C14 12.1046 13.1046 13 12 13Z"/></svg>`}
 function pinIcon(){return L.divIcon({className:'locpin',iconSize:[34,34],iconAnchor:[17,34],popupAnchor:[0,-31],html:pinSvg(PIN_COLORS[baseKey]||'#2563eb',34)})}
 function areaPinIcon(){return L.divIcon({className:'locpin areapin',iconSize:[30,30],iconAnchor:[15,30],popupAnchor:[0,-28],html:pinSvg(PIN_COLORS[baseKey]||'#2563eb',30)})}
-function setBase(k){baseKey=k;if(baseLayer)map.removeLayer(baseLayer);baseLayer=BASES[k]().addTo(map);baseLayer.eachLayer?baseLayer.eachLayer(l=>l.setZIndex&&l.setZIndex(1)):0;renderBases();if(pinMark&&pinMark.setIcon)pinMark.setIcon(pinIcon());if(ovG)ovG.eachLayer(l=>l.setIcon&&l.setIcon(areaPinIcon()))}
-function renderBases(){$('#bases').innerHTML=Object.keys(BASES).map(k=>`<button class="chip ${k===baseKey?'on':''}" data-k="${k}">${t('bm_'+k)}</button>`).join('');$$('#bases .chip').forEach(b=>b.onclick=()=>setBase(b.dataset.k))}
+/* ---- layer picker ---- */
+function gFallback(){if(GCFG)GCFG.enabled=false;if(map&&BASES[baseKey]&&BASES[baseKey].g){toast(t('ly_fb_on'));setBase('satl',false)}else renderPop()}
+async function gFail(force){if(gBusy)return;gBusy=true;
+  try{if(force)return gFallback();const c=await api('/api/gmaps/config?recheck=1');GCFG=c;if(!c.enabled)gFallback()}
+  catch(e){gFallback()}finally{gBusy=false}}
+function setBase(k,persist=true){
+  if(!BASES[k]||(BASES[k].g&&!(GCFG&&GCFG.enabled)))k='satl';
+  baseKey=k;if(persist){try{localStorage.base=k}catch(e){}}
+  if(baseLayer)map.removeLayer(baseLayer);
+  baseLayer=BASES[k].make(BASES[k].g?gFail:null).addTo(map);
+  if(baseLayer.eachLayer)baseLayer.eachLayer(l=>l.setZIndex&&l.setZIndex(1));
+  syncOverlay();
+  if(pinMark&&pinMark.setIcon)pinMark.setIcon(pinIcon());if(ovG)ovG.eachLayer(l=>l.setIcon&&l.setIcon(areaPinIcon()));
+  renderLyBtn();renderPop()}
+function syncOverlay(){if(trafficL){map.removeLayer(trafficL);trafficL=null}
+  if(trafficOn&&GCFG&&GCFG.enabled)trafficL=tl(GT('traffic'),{pane:'trafficPane',maxNativeZoom:20,maxZoom:22,opacity:.9}).addTo(map)}
+function tileXY(lat,lng,z){const n=2**z,r=lat*Math.PI/180;
+  return[z,Math.max(0,Math.min(n-1,Math.floor((lng+180)/360*n))),Math.max(0,Math.min(n-1,Math.floor((1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*n)))]}
+/* live preview: one real tile of the area currently on screen, in every map style */
+function pvTiles(k){const c=map?map.getCenter():{lat:23.8,lng:90.4},z=map?Math.max(3,Math.min(15,Math.round(map.getZoom())-2)):8,[Z,x,y]=tileXY(c.lat,c.lng,z);
+  return BASES[k].pv().map(u=>u.replace('{z}',Z).replace('{x}',x).replace('{y}',y).replace('{s}','a').replace('{r}',''))}
+const thumbHTML=k=>`<span class="thumb">${pvTiles(k).map(u=>`<img src="${esc(u)}" alt="" loading="lazy" onerror="this.remove()">`).join('')}</span>`;
+function renderLyBtn(){const b=$('#lyBtn');if(!b||!map)return;b.innerHTML=thumbHTML(baseKey)+`<span class="lb">${t('ly_btn')}</span>`;b.title=t('ly_title')}
+function renderPop(){const p=$('#lyPop');if(!p||p.hidden||!map)return;
+  const ge=!!(GCFG&&GCFG.enabled),st=ge?['ok','ly_ok']:(GCFG&&GCFG.configured?['warn','ly_fb_on']:['warn','ly_nokey']);
+  const card=k=>`<button class="lp-card ${k===baseKey?'on':''} ${BASES[k].g&&!ge?'dis':''}" data-k="${k}" aria-pressed="${k===baseKey}">${thumbHTML(k)}<span class="n">${t('bm_'+k)}</span></button>`;
+  p.innerHTML=`<div class="lp-head"><b>${t('ly_title')}</b><button class="icon" id="lpx" aria-label="${t('close')}" style="width:32px;height:32px">${ico('x',15)}</button></div>
+  <div class="lp-st ${st[0]}">${t(st[1])}</div>
+  <h5>${t('ly_google')}</h5><div class="lp-grid">${GKEYS.map(card).join('')}</div>
+  <h5>${t('ly_open')}</h5><div class="lp-grid">${OKEYS.map(card).join('')}</div>
+  <h5>${t('ly_details')}</h5><label class="chk"><input type="checkbox" id="lpTraffic" ${trafficOn?'checked':''} ${ge?'':'disabled'}><span>${t('ly_traffic')}</span></label>`;
+  p.querySelectorAll('.lp-card').forEach(c=>c.onclick=()=>{const k=c.dataset.k;if(BASES[k].g&&!ge)return toast(t(st[1]));setBase(k,true)});
+  $('#lpx').onclick=()=>{p.hidden=true};
+  $('#lpTraffic').onchange=e=>{trafficOn=e.target.checked;syncOverlay()}}
+/* side panel: hide completely (class on the map keeps buttons/scale in sync) */
+function setPanel(open){$('#panel').classList.toggle('hide',!open);$('#v-map').classList.toggle('pclosed',!open);$('#ptoggle').setAttribute('aria-expanded',String(open))}
 function initMap(){
   if(mapReady)return;mapReady=true;
   map=L.map('map',{zoomControl:false,maxZoom:22}).setView([23.7,90.35],7);
   L.control.zoom({position:'bottomright'}).addTo(map);L.control.scale({imperial:false,position:'bottomleft'}).addTo(map);
-  map.createPane('landPane').style.zIndex=410;map.createPane('plotPane').style.zIndex=420;map.createPane('boundPane').style.zIndex=405;
-  apiG=L.layerGroup().addTo(map);landG=L.layerGroup().addTo(map);plotG=L.layerGroup().addTo(map);ovG=L.layerGroup().addTo(map);setBase('satl');
+  map.createPane('landPane').style.zIndex=410;map.createPane('plotPane').style.zIndex=420;map.createPane('boundPane').style.zIndex=405;map.createPane('trafficPane').style.zIndex=300;map.getPane('trafficPane').style.pointerEvents='none';
+  apiG=L.layerGroup().addTo(map);landG=L.layerGroup().addTo(map);plotG=L.layerGroup().addTo(map);ovG=L.layerGroup().addTo(map);setBase(baseKey,false);
   $('#lyLand').onchange=e=>e.target.checked?landG.addTo(map):map.removeLayer(landG);
   $('#lyPlot').onchange=e=>e.target.checked?plotG.addTo(map):map.removeLayer(plotG);
   $('#lbl').onchange=updateLabels;map.on('zoomend',updateLabels);map.on('moveend',autoLoad);
   $('#op').oninput=()=>{const o=+$('#op').value;landG.eachLayer(g=>g.setStyle&&g.setStyle({fillOpacity:o}))};
-  $('#ptoggle').onclick=()=>$('#panel').classList.toggle('hide');
+  $('#ptoggle').onclick=()=>setPanel($('#panel').classList.contains('hide'));
+  $('#lyBtn').onclick=e=>{e.stopPropagation();const p=$('#lyPop');p.hidden=!p.hidden;if(!p.hidden)renderPop()};
+  document.addEventListener('click',e=>{const p=$('#lyPop');if(p&&!p.hidden&&!e.target.closest('#lyPop,#lyBtn'))p.hidden=true});
+  addEventListener('keydown',e=>{if(e.key==='Escape')$('#lyPop').hidden=true});
   $('#fit').onclick=()=>fitData();$('#m_all').onclick=()=>{loadIds([]);fitAll()};
   $('#q').oninput=()=>{clearTimeout(searchT);searchT=setTimeout(renderList,220)};
   const pl=()=>{const v=$('#place').value.trim();if(v)geocode(v)};$('#place').onkeydown=e=>{if(e.key==='Enter')pl()};
@@ -1973,11 +2182,11 @@ function wktGeo(wkt){
   return {type:m[1].toUpperCase()==='POLYGON'?'Polygon':'MultiPolygon',coordinates:stack[0][0]};
 }
 async function showMap(q,keep){
-  initMap();setTimeout(()=>map.invalidateSize(),60);
+  await ensureG();initMap();setTimeout(()=>map.invalidateSize(),60);
   const isApi=dataMode==='api';$('#m_dsNav').hidden=isApi;$('#m_apiNav').hidden=!isApi;
   if(isApi)bindApi('m_');
   else cascade($('#m_dist'),$('#m_sheet'),true,w=>{const d=$('#m_dist').value,s=$('#m_sheet').value;if(!d)return loadIds([]);loadIds(s&&s!=='*'?[s]:sheetsOf(d).map(x=>x.id))});
-  renderBases();sidebar();
+  sidebar();
   if(keep){if(curSel)showDrawer(curSel[0],curSel[1]);return}
   const ds=(q.get('ds')||'').split(',').filter(i=>DSL.some(d=>d.id===i));
   if(q.get('place'))return geocode(q.get('place'));
@@ -2013,7 +2222,7 @@ async function selectPlot(ds,no,zoom){
   if(!plotLayers[ds+'|'+no])await loadIds([...new Set([...loaded,ds])],{fit:false});
   const l=plotLayers[ds+'|'+no];curSel=[ds,no];
   if(l){highlight(l);if(zoom)map.fitBounds(l.getBounds(),{maxZoom:20,padding:[70,70]})}
-  mapUrl(no);showDrawer(ds,no);if(innerWidth<760)$('#panel').classList.add('hide')}
+  mapUrl(no);showDrawer(ds,no);if(innerWidth<760)setPanel(false)}
 function sidebar(){
   const lf=DATA?DATA.land.features:[],pf=DATA?DATA.plot.features:[];
   const total=(pf.length?pf:lf).reduce((a,f)=>a+f.properties.area_sqm,0),cs={};
@@ -2108,7 +2317,9 @@ function drawReport(){const r=VR;if(!r)return;
    <div class="card wide"><h3>${t('v_advice')}</h3><ul class="adv">${r.advice.map(a=>`<li>${X(nm(a))}</li>`).join('')}</ul></div>
   </div>`;
   if(vmap){vmap.remove();vmap=null}
-  vmap=L.map('vmap',{zoomControl:false,attributionControl:false});L.tileLayer(esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:21,maxNativeZoom:19}).addTo(vmap);
+  vmap=L.map('vmap',{zoomControl:false,attributionControl:false});
+  const esriSat=()=>L.tileLayer(esri+'World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:21,maxNativeZoom:19});
+  let vb=(GCFG&&GCFG.enabled)?BASES.g_sat.make(()=>{if(vmap){vmap.removeLayer(vb);vb=esriSat().addTo(vmap)}}):esriSat();vb.addTo(vmap);
   const g=L.geoJSON(r.geometry,{style:{color:'#ffd60a',weight:3,fillOpacity:.18}}).addTo(vmap);
   const b=g.getBounds(),z=vmap.getBoundsZoom(b,false,[24,24]);vmap.setView(b.getCenter(),Math.max(z-1,1))}
 
@@ -2260,6 +2471,12 @@ pr_date:["তারিখ","Date"],pr_nature:["প্রকৃতি","Nature"],
 pr_decl:["এতদ্বারা প্রত্যয়ন করা যাইতেছে যে, উপর্যুক্ত দাগের ভূমি সম্পর্কে সরকারি ভূমি মানচিত্র সেবা হইতে প্রাপ্ত জ্যামিতিক তথ্য এবং এই প্ল্যাটফর্মের যাচাই ইঞ্জিনের বিশ্লেষণের ভিত্তিতে এই প্রতিবেদন প্রস্তুত করা হইয়াছে। প্রতিবেদনে উল্লিখিত তথ্য প্রস্তুতের তারিখ পর্যন্ত হালনাগাদ।","It is hereby certified that this report has been prepared on the basis of geometric data obtained from the government land-map service and the analysis of this platform's verification engine in respect of the plot described above. The particulars stated are current as of the date of issue."],
 pr_disc:["দ্রষ্টব্য: এটি শুধুমাত্র তথ্যগত ডেমো প্রতিবেদন — মালিকানার প্রমাণ বা আদালতে গ্রহণযোগ্য দলিল নয়। কোনো লেনদেনের আগে ইউনিয়ন ভূমি অফিস ও সাব-রেজিস্ট্রি থেকে মূল রেকর্ড যাচাই করুন।","Note: This is a demo report for information only — not proof of title or a court-admissible document. Verify original records at the union land office and sub-registry before any transaction."],
 pr_sig1:["প্রস্তুতকারী: আমার ভূমি যাচাই ইঞ্জিন (স্বয়ংক্রিয়)","Prepared by: AmarBhumi verification engine (automated)"],pr_sig2:["যাচাইকারী কর্মকর্তার স্বাক্ষর ও সিল","Signature & seal of verifying officer"],pr_pg:["অনলাইনে যাচাই:","Verify online:"]});
+Object.assign(IC,{panel:'<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>'});
+Object.assign(T,{
+ly_btn:["লেয়ার","Layers"],ly_title:["মানচিত্রের ধরন","Map type"],ly_google:["গুগল ম্যাপ","Google Maps"],ly_open:["ওপেন ম্যাপ (ব্যাকআপ)","Open maps (backup)"],ly_details:["মানচিত্রের বিবরণ","Map details"],ly_traffic:["ট্রাফিক","Traffic"],
+ly_ok:["গুগল ম্যাপ সংযুক্ত আছে","Google Maps connected"],ly_fb_on:["গুগল ম্যাপ পাওয়া যাচ্ছে না — ব্যাকআপ (Leaflet) ম্যাপ চলছে","Google Maps unavailable — Leaflet backup map in use"],
+ly_nokey:["GOOGLE_MAPS_API_KEY সেট করা নেই — ব্যাকআপ ম্যাপ চলছে","GOOGLE_MAPS_API_KEY is not set — backup map in use"],
+bm_g_sat:["স্যাটেলাইট","Satellite"],bm_g_hyb:["হাইব্রিড","Hybrid"],bm_g_road:["সড়ক","Roadmap"],bm_g_ter:["ভূসংস্থান","Terrain"]});
 let ME=null,CFG={},JSEL=null;
 const post=async(u,b)=>{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j};
 async function loadMe(){try{CFG=await (await fetch('/api/auth/me')).json();ME=CFG.user||null;role=ME?ME.role:'user'}catch(e){ME=null}}
@@ -2283,7 +2500,7 @@ $('#umenu').onclick=async e=>{const b=e.target.closest('[data-sw]');
   if(b){if(b.dataset.sw===ME.id)return;try{const j=await post('/api/auth/switch',{id:b.dataset.sw});ME=j.user;role=ME.role;toggleUmenu(false);
     if(role!=='admin'&&cur.path.startsWith('/admin'))location.hash='#/';await switchMode('api');applyStatic();toast(nm(ME.name)+' · '+t('role_'+role))}catch(er){toast(er.message)}return}
   if(e.target.closest('#lout')){await post('/api/auth/logout').catch(()=>{});ME=null;CFG.judge=false;toggleUmenu(false);try{google.accounts.id.disableAutoSelect()}catch(x){}applyStatic();route(false)}};
-async function enter(j){ME=j.user;CFG.judge=j.judge;role=ME.role;try{await refreshData()}catch(e){}applyStatic();goto('#/')}
+async function enter(j){ME=j.user;CFG.judge=j.judge;role=ME.role;GP=null;GCFG=null;ensureG();try{await refreshData()}catch(e){}applyStatic();goto('#/')}
 const GIC='<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3A12 12 0 1 1 24 12c3 0 5.8 1.1 7.9 3l5.7-5.7A20 20 0 1 0 44 24c0-1.3-.1-2.7-.4-3.9z"/><path fill="#FF3D00" d="m6.3 14.7 6.6 4.8A12 12 0 0 1 24 12c3 0 5.8 1.1 7.9 3l5.7-5.7A20 20 0 0 0 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2A12 12 0 0 1 12.7 28l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3a12 12 0 0 1-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.7-.4-3.9z"/></svg>';
 function gisInit(){if(!window.google||!google.accounts)return setTimeout(gisInit,300);
   google.accounts.id.initialize({client_id:CFG.google_client_id,callback:async r=>{try{await enter(await post('/api/auth/google',{credential:r.credential}))}catch(e){toast(e.message)}}});
@@ -2336,7 +2553,7 @@ function printReport(){const r=VR;if(!r)return;
   setTimeout(()=>print(),200)}
 
 (async()=>{await loadMe();applyStatic();syncThemeIcon();
-  if(ME){try{await refreshData()}catch(e){toast(e.message)}}
+  if(ME){ensureG();try{await refreshData()}catch(e){toast(e.message)}}
   route(false)})();
 </script>
 </body>
