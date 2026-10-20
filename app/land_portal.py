@@ -19,8 +19,8 @@ TWO ISOLATED DATA MODES (header switch, X-Data-Mode sent by the front-end)
 
     Government service URL can be overridden with BD_MAP_URL.
 
-    Google Maps is the primary base map (Map Tiles API, proxied so the key stays server-side):
-    put GOOGLE_MAPS_API_KEY=... in .env. Leaflet/Esri is the automatic fallback.
+    Google Maps is the primary base map (public Google tile endpoints, no API key/Map Tiles API).
+    Leaflet/Esri is the automatic fallback.
 
 Roles (MVP, no login):  User = public pages.  Admin = switch in the header -> #/admin
 Ownership, cases, fraud alerts and mutation workflow are DUMMY data (deterministic).
@@ -672,96 +672,6 @@ def record(key):
 # ----------------------------------------------------------------- API
 def err(msg, code=400):
     return jsonify(error=msg), code
-
-
-# ----------------------------------------------------------------- Google Maps (Map Tiles API) proxy
-# The key never reaches the browser: tiles are fetched server-side through /api/gtile/... (login required).
-# Enable "Map Tiles API" for the key in Google Cloud. If the key is missing or Google fails, the
-# front-end silently falls back to the Leaflet/Esri base maps.
-GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
-G_TYPES = {
-    "sat": {"mapType": "satellite"},
-    "hyb": {"mapType": "satellite", "layerTypes": ["layerRoadmap"]},
-    "road": {"mapType": "roadmap"},
-    "ter": {"mapType": "terrain", "layerTypes": ["layerRoadmap"]},
-    "traffic": {"mapType": "roadmap", "layerTypes": ["layerTraffic"], "overlay": True},
-}
-_g = {"sess": {}, "down": {}, "health": None, "lock": threading.Lock()}
-
-
-def _g_session(kind, lang, force=False):
-    key, now = (kind, lang), time.time()
-    with _g["lock"]:
-        s = _g["sess"].get(key)
-        if s and now < s["exp"] - 300 and not (force and now - s["at"] > 30):
-            return s["id"]
-        if now < _g["down"].get(key, 0):
-            raise RuntimeError("Google Map Tiles temporarily unavailable")
-    body = dict(G_TYPES[kind], language="bn-BD" if lang == "bn" else "en-US", region="BD")
-    req = urllib.request.Request(
-        "https://tile.googleapis.com/v1/createSession?key=" + urllib.parse.quote(GMAPS_KEY),
-        data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=8) as r:
-            j = json.loads(r.read().decode("utf-8"))
-        sid = j["session"]
-    except Exception as exc:
-        with _g["lock"]:
-            _g["down"][key] = time.time() + 30  # do not hammer Google while it is failing
-        raise RuntimeError(f"Google session failed: {exc}") from exc
-    try:
-        exp = int(j.get("expiry") or 0)
-    except (TypeError, ValueError):
-        exp = 0
-    with _g["lock"]:
-        _g["sess"][key] = {"id": sid, "exp": exp or now + 3600, "at": now}
-    return sid
-
-
-def _g_health(force=False):
-    if not GMAPS_KEY:
-        return False
-    now, c = time.time(), _g["health"]
-    if not force and c and now - c[0] < (300 if c[1] else 45):
-        return c[1]
-    if force:
-        with _g["lock"]:
-            _g["down"].clear()
-    try:
-        _g_session("sat", "en-US", force=force)
-        ok = True
-    except RuntimeError:
-        ok = False
-    _g["health"] = (time.time(), ok)
-    return ok
-
-
-@app.route("/api/gmaps/config")
-def api_gmaps_config():
-    return jsonify(configured=bool(GMAPS_KEY), enabled=_g_health(request.args.get("recheck") == "1"), types=sorted(G_TYPES))
-
-
-@app.route("/api/gtile/<kind>/<int:z>/<int:x>/<int:y>")
-def api_gtile(kind, z, x, y):
-    if not GMAPS_KEY or kind not in G_TYPES or not 0 <= z <= 22 or not (0 <= x < 2 ** z and 0 <= y < 2 ** z):
-        return Response(status=404)
-    lang = "bn" if request.args.get("l") == "bn" else "en"
-    for attempt in (0, 1):
-        try:
-            sid = _g_session(kind, lang, force=attempt == 1)
-            url = (f"https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}?session={urllib.parse.quote(sid)}"
-                   f"&key={urllib.parse.quote(GMAPS_KEY)}")
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "AmarBhumi/1.0"}), timeout=12) as r:
-                data, ctype, cc = r.read(), r.headers.get_content_type(), r.headers.get("Cache-Control")
-            # tiles are passed through, not stored: Google's terms only allow caching per its own headers
-            return Response(data, mimetype=ctype, headers={"Cache-Control": cc or "private, max-age=3600"})
-        except urllib.error.HTTPError as exc:
-            if exc.code in (400, 401, 403) and attempt == 0:
-                continue  # the session may have expired -> one retry with a fresh one
-            return Response(status=404 if exc.code == 404 else 502)
-        except (urllib.error.URLError, OSError, RuntimeError, ValueError):
-            return Response(status=502)
-    return Response(status=502)
 
 
 JUDGE_PW = "judge@2026"
@@ -2081,11 +1991,11 @@ const goPlace=()=>{const v=$('#h_place').value.trim();if(v)goto('#/map?place='+e
 $('#h_go').onclick=goPlace;$('#h_place').onkeydown=e=>{if(e.key==='Enter')goPlace()};
 
 /* ---------- map ---------- */
-let map,landG,plotG,apiG,ovG,baseLayer,baseKey=(()=>{try{return localStorage.base}catch(e){return null}})()||'g_sat',loaded=[],DATA=null,plotLayers={},selLayer=null,curSel=null,hiddenCls=new Set(),mapReady=false,pinMark=null,busy=false,searchT;
+let map,landG,plotG,apiG,ovG,baseLayer,baseKey=(()=>{try{return localStorage.base}catch(e){return null}})()||'g_hyb',loaded=[],DATA=null,plotLayers={},selLayer=null,curSel=null,hiddenCls=new Set(),mapReady=false,pinMark=null,busy=false,searchT;
 const esri='https://server.arcgisonline.com/ArcGIS/rest/services/';
 let GCFG=null,GP=null,gBusy=false,trafficOn=false,trafficL=null;
-/* ---- Google tiles are fetched through our own proxy (/api/gtile) so the API key stays on the server ---- */
-const GT=k=>`/api/gtile/${k}/{z}/{x}/{y}?l=${lang}`;
+/* ---- Google public tile endpoints (no API key / Map Tiles API needed) ---- */
+const GT=k=>`https://mt0.google.com/vt/lyrs=${{sat:'s',hyb:'y',road:'m',ter:'p',traffic:'m,traffic'}[k]}&x={x}&y={y}&z={z}&hl=${lang==='bn'?'bn':'en'}`;
 const gl=(k,onFail)=>{const l=L.tileLayer(GT(k),{maxNativeZoom:20,maxZoom:22,attribution:'Map data © Google'});let ok=0,bad=0,strikes=0;
   l.on('tileload',()=>ok++);
   l.on('tileerror',()=>{bad++;if(onFail&&bad>=5&&bad>ok){bad=0;ok=0;strikes++;onFail(strikes>=2)}});return l};
@@ -2104,17 +2014,15 @@ const BASES={
  dark:{pv:()=>['https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'],make:()=>tl('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxNativeZoom:20,maxZoom:22,attribution:'© OSM, © CARTO'})}};
 const GKEYS=['g_sat','g_hyb','g_road','g_ter'],OKEYS=['satl','sat','osm','topo','light','dark'];
 const PIN_COLORS={g_sat:'#ff453a',g_hyb:'#ff453a',g_road:'#2563eb',g_ter:'#7c3aed',sat:'#ff453a',satl:'#ff453a',osm:'#2563eb',topo:'#7c3aed',light:'#e11d48',dark:'#22d3ee'};
-/* Google is asked once per session whether it works (key present + Map Tiles API enabled); otherwise Leaflet/Esri takes over */
-function ensureG(){return GP||(GP=api('/api/gmaps/config').catch(()=>({configured:false,enabled:false})).then(c=>{GCFG=c;
-  if(!BASES[baseKey])baseKey='g_sat';if(!c.enabled&&BASES[baseKey].g)baseKey='satl';return c}))}
+/* Google tiles need no key/session; if they fail the Leaflet/Esri maps take over */
+function ensureG(){GCFG={configured:true,enabled:true};
+  if(!BASES[baseKey])baseKey='g_hyb';return Promise.resolve(GCFG)}
 function pinSvg(c,size){return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true"><path fill="${c}" fill-rule="evenodd" d="M18.364 17.364L12 23.7279L5.63604 17.364C2.12132 13.8492 2.12132 8.15076 5.63604 4.63604C9.15076 1.12132 14.8492 1.12132 18.364 4.63604C21.8787 8.15076 21.8787 13.8492 18.364 17.364ZM12 15C14.2091 15 16 13.2091 16 11C16 8.79086 14.2091 7 12 7C9.79086 7 8 8.79086 8 11C8 13.2091 9.79086 15 12 15ZM12 13C10.8954 13 10 12.1046 10 11C10 9.89543 10.8954 9 12 9C13.1046 9 14 9.89543 14 11C14 12.1046 13.1046 13 12 13Z"/></svg>`}
 function pinIcon(){return L.divIcon({className:'locpin',iconSize:[34,34],iconAnchor:[17,34],popupAnchor:[0,-31],html:pinSvg(PIN_COLORS[baseKey]||'#2563eb',34)})}
 function areaPinIcon(){return L.divIcon({className:'locpin areapin',iconSize:[30,30],iconAnchor:[15,30],popupAnchor:[0,-28],html:pinSvg(PIN_COLORS[baseKey]||'#2563eb',30)})}
 /* ---- layer picker ---- */
 function gFallback(){if(GCFG)GCFG.enabled=false;if(map&&BASES[baseKey]&&BASES[baseKey].g){toast(t('ly_fb_on'));setBase('satl',false)}else renderPop()}
-async function gFail(force){if(gBusy)return;gBusy=true;
-  try{if(force)return gFallback();const c=await api('/api/gmaps/config?recheck=1');GCFG=c;if(!c.enabled)gFallback()}
-  catch(e){gFallback()}finally{gBusy=false}}
+function gFail(){if(gBusy)return;gBusy=true;try{gFallback()}finally{gBusy=false}}
 function setBase(k,persist=true){
   if(!BASES[k]||(BASES[k].g&&!(GCFG&&GCFG.enabled)))k='satl';
   baseKey=k;if(persist){try{localStorage.base=k}catch(e){}}
@@ -2475,7 +2383,7 @@ Object.assign(IC,{panel:'<rect width="18" height="18" x="3" y="3" rx="2"/><path 
 Object.assign(T,{
 ly_btn:["লেয়ার","Layers"],ly_title:["মানচিত্রের ধরন","Map type"],ly_google:["গুগল ম্যাপ","Google Maps"],ly_open:["ওপেন ম্যাপ (ব্যাকআপ)","Open maps (backup)"],ly_details:["মানচিত্রের বিবরণ","Map details"],ly_traffic:["ট্রাফিক","Traffic"],
 ly_ok:["গুগল ম্যাপ সংযুক্ত আছে","Google Maps connected"],ly_fb_on:["গুগল ম্যাপ পাওয়া যাচ্ছে না — ব্যাকআপ (Leaflet) ম্যাপ চলছে","Google Maps unavailable — Leaflet backup map in use"],
-ly_nokey:["GOOGLE_MAPS_API_KEY সেট করা নেই — ব্যাকআপ ম্যাপ চলছে","GOOGLE_MAPS_API_KEY is not set — backup map in use"],
+ly_nokey:["গুগল ম্যাপ পাওয়া যাচ্ছে না — ব্যাকআপ ম্যাপ চলছে","Google Maps unavailable — backup map in use"],
 bm_g_sat:["স্যাটেলাইট","Satellite"],bm_g_hyb:["হাইব্রিড","Hybrid"],bm_g_road:["সড়ক","Roadmap"],bm_g_ter:["ভূসংস্থান","Terrain"]});
 let ME=null,CFG={},JSEL=null;
 const post=async(u,b)=>{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j};
