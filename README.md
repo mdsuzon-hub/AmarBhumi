@@ -27,6 +27,23 @@ Find any plot on the map. Verify ownership before you buy. Track mutation cases 
 **https://amarbhumi-1.onrender.com/**  
 *(Demo environment — switch between Demo Data and Government API from the header)*
 
+## 📸 Live Demo Screenshots
+
+### Interactive Land Map
+| Map View 1 | Map View 2 | Map View 3 |
+|:----------:|:----------:|:----------:|
+| ![Map 1](docs/screenshots/map_1.png) | ![Map 2](docs/screenshots/map_2.png) | ![Map 3](docs/screenshots/map_3.png) |
+
+### Reports & Analysis
+| Report 1 | Report 2 |
+|:--------:|:--------:|
+| ![Report 1](docs/screenshots/report_1.png) | ![Report 2](docs/screenshots/report_2.png) |
+
+### PDF Reports (Portrait)
+| PDF Report 1 | PDF Report 2 |
+|:------------:|:------------:|
+| ![PDF Report 1](docs/screenshots/report_pdf_1.png) | ![PDF Report 2](docs/screenshots/report_pdf_2.png) |
+
 ---
 
 ## Why AmarBhumi?
