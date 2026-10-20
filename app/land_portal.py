@@ -2469,6 +2469,11 @@ function printReport(){const r=VR;if(!r)return;
 """
 
 
+import mutation_flow
+PAGE = mutation_flow.install(
+    app, PAGE, dict(data_dir=DATA_DIR, record=record, err=err, bn_digits=bn_digits))
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
