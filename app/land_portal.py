@@ -1675,7 +1675,7 @@ body.auth-mode main{margin-left:0}
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const BN='০১২৩৪৫৬৭৮৯';
 const IC={
-leaf:'<path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/><path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/>',
+home:'<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
 map:'<polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/><line x1="9" x2="9" y1="3" y2="18"/><line x1="15" x2="15" y1="6" y2="21"/>',
 search:'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
 shield:'<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
@@ -2258,7 +2258,7 @@ function syncThemeIcon(){const e=$('#themeIc');if(e)e.innerHTML=ico(document.doc
 const avatarOf=u=>u.picture?`<img src="${esc(u.picture)}" alt="" referrerpolicy="no-referrer">`:esc((nm(u.name)||'U').trim().charAt(0));
 function renderNav(){const el=$('#links');if(!el)return;if(!ME){el.innerHTML='';return}
   const g=(k,items)=>`<div class="ngrp">${t(k)}</div>`+items.map(([h,r,i,l])=>`<a href="${h}" data-r="${r}" data-h="${h}">${ico(i,18)}<span>${t(l)}</span></a>`).join('');
-  el.innerHTML=g('ng_services',[['#/','home','leaf','nav_home'],['#/map','map','map','nav_map'],['#/verify','verify','search','nav_verify'],['#/track','track','file','nav_track']])
+  el.innerHTML=g('ng_services',[['#/','home','home','nav_home'],['#/map','map','map','nav_map'],['#/verify','verify','search','nav_verify'],['#/track','track','file','nav_track']])
    +(role==='admin'?g('ng_admin',[['#/admin?tab=overview','admin','dash','a_overview'],['#/admin?tab=fraud','admin','shield','a_fraud'],['#/admin?tab=workflow','admin','clipboard','a_workflow'],['#/admin?tab=data','admin','layers','a_data']]):'')
    +`<div class="nfoot"><span class="avatar">${avatarOf(ME)}</span><span><b>${esc(nm(ME.name))}</b><span class="badge ${role==='admin'?'ok':''}">${t('role_'+role)}</span></span></div>`}
 function toggleUmenu(v){const m=$('#umenu');if(m)m.hidden=v===undefined?!m.hidden:!v}
