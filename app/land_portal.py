@@ -1514,6 +1514,8 @@ body.auth-mode main{margin-left:0}
 #gbtn{display:flex;justify-content:center;width:100%}
 .gdis{display:flex;gap:10px;align-items:center;justify-content:center;width:100%;height:40px;padding-block:0;opacity:.7;cursor:not-allowed}
 .login-card #jtoggle{height:40px;padding-block:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spin{display:inline-block;width:15px;height:15px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-3px}
 @media(max-width:860px){.login{grid-template-columns:1fr}.login-art{display:none}}
 #printDoc{display:none}
 @media print{
@@ -2240,7 +2242,7 @@ Object.assign(T,{
 role_user:["নাগরিক","Citizen"],ng_services:["সেবা","Services"],ng_admin:["প্রশাসন","Administration"],
 lg_title:["স্বাগতম","Welcome"],lg_sub:["চালিয়ে যেতে সাইন ইন করুন","Sign in to continue"],lg_or:["অথবা","or"],lg_google:["Google দিয়ে চালিয়ে যান","Continue with Google"],
 lg_google_off:["GOOGLE_CLIENT_ID সেট করা নেই — Google লগইন চালু করতে সেট করুন","GOOGLE_CLIENT_ID is not set — set it to enable Google sign-in"],
-lg_judge:["জাজ কুইক লগইন","Judge quick login"],lg_pick:["একটি ডেমো অ্যাকাউন্ট বেছে নিন","Pick a demo account"],lg_cred:["ডেমো ক্রেডেনশিয়াল","Demo credential"],lg_signin:["সাইন ইন","Sign in"],
+lg_judge:["জাজ কুইক লগইন","Judge quick login"],lg_pick:["একটি ডেমো অ্যাকাউন্ট বেছে নিন","Pick a demo account"],lg_cred:["ডেমো ক্রেডেনশিয়াল","Demo credential"],lg_signin:["সাইন ইন","Sign in"],lg_signing:["সাইন ইন হচ্ছে…","Signing in…"],
 lg_logout:["লগআউট","Log out"],lg_admins:["অ্যাডমিন অ্যাকাউন্ট (দ্রুত পরিবর্তন)","Admin accounts (quick switch)"],lg_users:["নাগরিক অ্যাকাউন্ট","Citizen accounts"],
 a_gate_d:["অ্যাডমিন টুল দেখতে একটি অ্যাডমিন অ্যাকাউন্টে যান।","Switch to an admin account to open the admin tools."],a_enable:["অ্যাকাউন্ট পরিবর্তন","Switch account"],
 a_note:["অ্যাডমিন কনসোল — শুধু অনুমোদিত ব্যবহারকারী","Admin console — authorised users only"],
@@ -2298,7 +2300,9 @@ async function renderLogin(){
   $('#jtoggle').onclick=()=>$('#jbox').hidden=!$('#jbox').hidden;
   $$('#jbox .urow').forEach(b=>b.onclick=()=>{JSEL=b.dataset.id;$$('#jbox .urow').forEach(x=>x.classList.toggle('on',x===b));const u=demo.find(x=>x.id===JSEL);
     $('#jcred').hidden=false;$('#jcred').innerHTML=`${t('lg_cred')}<br><b>${esc(u.email)}</b> / <b>${esc(CFG.demo_password)}</b>`;$('#jgo').disabled=false});
-  $('#jgo').onclick=async()=>{try{await enter(await post('/api/auth/judge',{id:JSEL,password:CFG.demo_password}))}catch(e){toast(e.message)}}}
+  $('#jgo').onclick=async()=>{const b=$('#jgo');if(b.dataset.busy)return;b.dataset.busy='1';b.disabled=true;const lbl=b.innerHTML;b.innerHTML=`<span class="spin"></span> ${t('lg_signing')}`;
+    try{await enter(await post('/api/auth/judge',{id:JSEL,password:CFG.demo_password}))}
+    catch(e){toast(e.message);delete b.dataset.busy;b.disabled=false;b.innerHTML=lbl}}}
 
 /* ---------- A4 legal-style report with QR + Code128 barcode ---------- */
 const h32=s=>{let h=2166136261;for(const c of s){h^=c.charCodeAt(0);h=Math.imul(h,16777619)}return h>>>0};
