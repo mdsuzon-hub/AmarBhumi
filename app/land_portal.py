@@ -1511,7 +1511,9 @@ body.auth-mode main{margin-left:0}
 .login-art h1{font-size:clamp(28px,3.4vw,42px);margin:14px 0 10px}.login-art p{opacity:.92;max-width:480px;margin:0}.login-art .pill{align-self:flex-start}
 .login-wrap{display:grid;place-items:center;padding:28px}.login-card{width:min(440px,100%);display:grid;gap:14px}
 .login-card .logo{margin-bottom:4px}.login-card h2{font-size:26px}
-.gdis{display:flex;gap:10px;align-items:center;justify-content:center;width:100%;opacity:.7;cursor:not-allowed}
+#gbtn{display:flex;justify-content:center;width:100%}
+.gdis{display:flex;gap:10px;align-items:center;justify-content:center;width:100%;height:40px;padding-block:0;opacity:.7;cursor:not-allowed}
+.login-card #jtoggle{height:40px;padding-block:0}
 @media(max-width:860px){.login{grid-template-columns:1fr}.login-art{display:none}}
 #printDoc{display:none}
 @media print{
@@ -2278,7 +2280,8 @@ async function enter(j){ME=j.user;CFG.judge=j.judge;role=ME.role;try{await refre
 const GIC='<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3A12 12 0 1 1 24 12c3 0 5.8 1.1 7.9 3l5.7-5.7A20 20 0 1 0 44 24c0-1.3-.1-2.7-.4-3.9z"/><path fill="#FF3D00" d="m6.3 14.7 6.6 4.8A12 12 0 0 1 24 12c3 0 5.8 1.1 7.9 3l5.7-5.7A20 20 0 0 0 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2A12 12 0 0 1 12.7 28l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3a12 12 0 0 1-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.7-.4-3.9z"/></svg>';
 function gisInit(){if(!window.google||!google.accounts)return setTimeout(gisInit,300);
   google.accounts.id.initialize({client_id:CFG.google_client_id,callback:async r=>{try{await enter(await post('/api/auth/google',{credential:r.credential}))}catch(e){toast(e.message)}}});
-  google.accounts.id.renderButton($('#gbtn'),{theme:'outline',size:'large',width:360,text:'continue_with',locale:lang==='bn'?'bn':'en'})}
+  const gw=Math.min(400,Math.round($('#gbtn').clientWidth||400));
+  google.accounts.id.renderButton($('#gbtn'),{theme:'outline',size:'large',width:gw,text:'continue_with',locale:lang==='bn'?'bn':'en'})}
 async function renderLogin(){
   try{CFG=await (await fetch('/api/auth/me')).json()}catch(e){}
   const demo=CFG.demo||[];JSEL=null;
