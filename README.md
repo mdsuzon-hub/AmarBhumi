@@ -2,6 +2,23 @@
 
 **Bangladesh’s modern land intelligence portal**
 
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-amarbhumi--1.onrender.com-blue?style=for-the-badge&logo=render)](https://amarbhumi-1.onrender.com/)
+[![GitHub](https://img.shields.io/badge/GitHub-mdsuzon--hub%2FAmarBhumi-181717?style=for-the-badge&logo=github)](https://github.com/mdsuzon-hub/AmarBhumi)
+[![License: Non-Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg?style=for-the-badge)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.x-blue?style=for-the-badge&logo=python)](https://www.python.org/)
+[![Flask](https://img.shields.io/badge/Flask-Framework-black?style=for-the-badge&logo=flask)](https://flask.palletsprojects.com/)
+[![Leaflet](https://img.shields.io/badge/Leaflet-Map-green?style=for-the-badge&logo=leaflet)](https://leafletjs.com/)
+
+<p align="left">
+  <a href="https://github.com/mdsuzon-hub/AmarBhumi">
+    <img src="https://img.shields.io/github/stars/mdsuzon-hub/AmarBhumi?style=for-the-badge&logo=github&label=%E2%AD%90%20Star%20this%20repo&color=yellow&labelColor=333" alt="Star this repo">
+  </a>
+</p>
+
+![Visitors](https://visitor-badge.laobi.icu/badge?page_id=mdsuzon-hub.AmarBhumi)
+![GitHub stars](https://img.shields.io/github/stars/mdsuzon-hub/AmarBhumi?style=social)
+![GitHub forks](https://img.shields.io/github/forks/mdsuzon-hub/AmarBhumi?style=social)
+
 Find any plot on the map. Verify ownership before you buy. Track mutation cases in real time. Detect fraud before it becomes a dispute.
 
 ---
