@@ -841,8 +841,10 @@ def install(app, page, ctx):
             if st != 1:
                 raise wrong()
             checks = app_checks(a, get_rec(a["land"]["ds"], a["land"]["plot_no"]))
-            if any(v == "fail" for _, v, _i in checks):
-                raise ActErr("failed checks — waive, return or reject / ব্যর্থ যাচাই — অব্যাহতি, ফেরত বা প্রত্যাখ্যান করুন", 409)
+            failed = [k for k, v, _i in checks if v == "fail"]
+            if failed:
+                raise ActErr("failed checks — waive, return or reject: %s / ব্যর্থ যাচাই — অব্যাহতি, ফেরত বা প্রত্যাখ্যান করুন: %s"
+                             % (", ".join(failed), ", ".join(failed)), 409)
             a["verification"] = {"by": user().get("name"), "date": today(), "note": note, "checks": checks}
             a["stage"] = 2
             a["timeline"] += [ev("verified", note), ev("inspection")]
@@ -1303,7 +1305,7 @@ bd_draft:["খসড়া / ফেরত","Draft / returned"],bd_closed:["প�
 dt_ov:["সারসংক্ষেপ","Overview"],dt_land:["ভূমি ও মানচিত্র","Land & map"],dt_docs:["কাগজপত্র","Documents"],dt_ver:["যাচাই প্রতিবেদন","Verification"],dt_tl:["ঘটনাপ্রবাহ","Timeline"],
 lt_class:["ভূমির সম্পূর্ণ শ্রেণিবিন্যাস","Full land classification"],lt_use:["ব্যবহার","Use"],lt_share:["অংশ","Share"],lt_total:["মোট","Total"],lt_map:["অবস্থান","Location"],lt_risk:["রেজিস্ট্রি ঝুঁকি","Registry risk"],lt_viewmap:["মানচিত্রে দেখুন","View on map"],lt_gm:["গুগল ম্যাপ","Google Maps"],lt_cls:["শ্রেণি","Class"],lt_flags:["জালিয়াতি সতর্কতা","Fraud flags"],lt_pend:["চলমান মামলা","Pending cases"],lt_noparts:["শ্রেণির তথ্য নেই","No classification data"],
 eta_t:["আনুমানিক সময় ও সময়সূচি","Estimated time & schedule"],eta_rem:["আনুমানিক বাকি (দিন)","Est. days left"],eta_est:["সম্ভাব্য সমাপ্তি","Estimated finish"],eta_sla:["সেবার সময়সীমা (দিন)","Deadline (days)"],eta_step:["বর্তমান ধাপ (কাটানো / বরাদ্দ)","This step (spent / planned)"],eta_done:["মোট সময় লেগেছে","Completed in"],eta_days:["দিন","days"],
-vr_title:["পূর্ণ যাচাই প্রতিবেদন","Full verification report"],vr_sum:["সারসংক্ষেপ","Summary"],vr_waive:["অব্যাহতি","Waive"],vr_unwaive:["প্রত্যাহার","Revoke"],vr_notice:["নোটিশ","Notice"],vr_print:["প্রতিবেদন প্রিন্ট","Print report"],vr_registry:["রেজিস্ট্রি ঝুঁকি বিশ্লেষণ","Registry risk analysis"],vr_chain:["মালিকানার ধারা","Ownership chain"],vr_advice:["পরামর্শ","Advice"],vr_hint:["অব্যাহতির জন্য নিচের প্যানেলে কারণ লিখে বোতাম চাপুন।","To waive, type the reason in the panel below, then press the button."],
+vr_title:["পূর্ণ যাচাই প্রতিবেদন","Full verification report"],vr_sum:["সারসংক্ষেপ","Summary"],vr_waive:["অব্যাহতি","Waive"],vr_unwaive:["প্রত্যাহার","Revoke"],vr_notice:["নোটিশ","Notice"],vr_print:["প্রতিবেদন প্রিন্ট","Print report"],vr_registry:["রেজিস্ট্রি ঝুঁকি বিশ্লেষণ","Registry risk analysis"],vr_chain:["মালিকানার ধারা","Ownership chain"],vr_advice:["পরামর্শ","Advice"],vr_hint:["কারণ লিখে যাচাইয়ের পাশের ‘অব্যাহতি’ বোতাম চাপুন; সব ব্যর্থ যাচাই অব্যাহতিপ্রাপ্ত হলে ‘যাচাই সম্পন্ন’ চাপুন।","Enter a reason, press Waive next to a check, then press ‘Verified’ once every failed check is waived."],vr_reason_ph:["অব্যাহতির কারণ / মন্তব্য","Reason / remark for the waiver"],vr_proceed:["যাচাই সম্পন্ন — তদন্তে পাঠান","Verified — send for inspection"],vr_waive_first:["আগে সব ব্যর্থ যাচাই অব্যাহতি দিন","Waive every failed check first"],
 sn_t:["বিশেষ নোটিশ","Special notices"],sn_new:["বিশেষ নোটিশ পাঠান","Send special notice"],sn_to:["প্রাপক","Recipient"],sn_applicant:["আবেদনকারী","Applicant"],sn_previous_owner:["পূর্বের মালিক","Previous owner"],sn_neighbors:["প্রতিবেশী","Neighbours"],sn_other:["অন্য কেউ","Other"],sn_other_n:["প্রাপকের নাম","Recipient name"],sn_sub:["বিষয়","Subject"],sn_msg:["বক্তব্য","Message"],sn_days:["সাড়া দেওয়ার সময় (দিন)","Days to respond"],sn_send:["নোটিশ পাঠান","Send notice"],sn_open:["চলমান","Open"],sn_closed:["নিষ্পন্ন","Closed"],sn_deadline:["শেষ তারিখ","Deadline"],sn_reply:["উত্তর দিন","Reply"],sn_reply_ph:["আপনার উত্তর…","Your reply…"],sn_close:["নিষ্পন্ন করুন","Close"],sn_sent:["নোটিশ পাঠানো হয়েছে","Notice sent"],
 demo_fill:["ডেমো তথ্য","Demo data"],demo_docs:["ডেমো কাগজ সংযুক্ত করুন","Attach demo documents"],demo_load:["ডেমো কেস লোড করুন","Load demo cases"],demo_chip:["ডেমো ট্র্যাকিং লিংক — এক ক্লিকে দেখুন","Demo tracking links — one click"],demo_hint:["ফর্মের ঘরে টাইপ করলে ডেমো তথ্যের পরামর্শ আসবে; নাম বেছে নিলে বাকি ঘর নিজে পূরণ হবে।","Typing in a field suggests demo values; picking a name fills the other fields."],demo_loaded:["ডেমো কেস যোগ হয়েছে","Demo cases added"],
 tk_by:["আইডি, দলিল নং, নোটিশ নং বা ডিসিআর নং দিয়ে খুঁজুন","Search by ID, deed no., notice no. or DCR no."]
@@ -1347,6 +1349,17 @@ const ST={tab:'deeds',deeds:[],apps:[],admin:false};
 const VS={deeds:{q:'',f:{},sort:'created',dir:-1,page:1,size:LSg('size_deeds',10),view:LSg('view_deeds','card')},apps:{q:'',f:{},sort:'created',dir:-1,page:1,size:LSg('size_apps',10),view:LSg('view_apps','card')}};
 const DT={id:null,tab:'ov'};let LM=null;
 function show(html){const d=dlg();d.innerHTML=html;if(!d.open)d.showModal();const x=d.querySelector('[data-x]');if(x)x.onclick=()=>d.close()}
+function askReason(title,val){return new Promise(res=>{const d=document.createElement('dialog');d.style.width='min(460px,94vw)';document.body.appendChild(d);
+  const close=v=>{try{d.close()}catch(e){}if(d.isConnected)d.remove();res(v)};
+  d.innerHTML=`<div class="dhead"><div><h2 style="font-size:19px">${title}</h2></div><button class="icon" data-x aria-label="${t('close')}">${ico('x')}</button></div>
+   <label class="f"><span>${m('vr_reason_ph')}</span><textarea id="mfAskTxt" rows="3" maxlength="300">${esc(val||'')}</textarea></label>
+   <div class="btnrow" style="margin-top:14px;justify-content:flex-end"><button class="btn alt" data-cancel>${m('cancel')}</button><button class="btn" data-ok>${ico('check',15)} ${m('vr_waive')}</button></div>`;
+  const txt=d.querySelector('#mfAskTxt'),ok=d.querySelector('[data-ok]');
+  d.querySelector('[data-x]').onclick=()=>close('');d.querySelector('[data-cancel]').onclick=()=>close('');
+  ok.onclick=()=>{const v=txt.value.trim();if(!v){toast(m('need_reason'));txt.focus();return}close(v)};
+  txt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ok.click()}});
+  d.addEventListener('cancel',e=>{e.preventDefault();close('')});
+  d.showModal();setTimeout(()=>txt.focus(),30)})}
 dlg().addEventListener('close',()=>{if(LM){LM.remove();LM=null}});
 const head=(ti,su)=>`<div class="dhead"><div><h2 style="font-size:20px">${ti}</h2>${su?`<p style="margin:2px 0 0;color:var(--mu);font-size:13.5px">${su}</p>`:''}</div><button class="icon" data-x aria-label="${t('close')}">${ico('x')}</button></div>`;
 const kv=rows=>`<dl class="kv">${rows.filter(r=>r[1]!==undefined&&r[1]!=='').map(([a,b])=>`<dt>${a}</dt><dd>${b}</dd>`).join('')}</dl>`;
@@ -1667,6 +1680,8 @@ function verPane(a,rec){const cs=a.checks,n=l=>cs.filter(c=>c[1]===l).length;
    <div class="card"><h3>${m('vr_chain')}</h3><ul class="tl">${rec.history.map(h=>`<li><b>${t('h_'+h.type)}</b> — ${esc(nm(h.from))} → ${esc(nm(h.to))}<small>${fd(h.date)} · ${t('v_deed')} ${X(h.deed_no)}</small></li>`).join('')}</ul></div></div>
    <div class="card" style="margin-top:14px"><h3>${m('vr_advice')}</h3><ul class="adv">${rec.advice.map(x=>`<li>${X(nm(x))}</li>`).join('')}</ul></div>`:'';
   return `<div class="card" style="margin-top:14px"><div class="mf-row"><h3 style="margin:0">${m('vr_title')}</h3><div class="btnrow"><button class="btn sm alt" data-snk="">${ico('send',14)} ${m('sn_new')}</button><button class="btn sm alt" id="a_pdver">${ico('printer',14)} ${m('vr_print')}</button></div></div>
+   <div class="mf-row" style="margin:10px 0;gap:8px;flex-wrap:wrap"><input id="vr_reason" placeholder="${esc(m('vr_reason_ph'))}" style="flex:1;min-width:220px">
+    ${a.stage===1?`<button class="btn sm" data-vproceed ${n('fail')?'disabled':''}>${ico('check',14)} ${m('vr_proceed')}</button>`:''}${a.stage===1&&n('fail')?`<span class="mf-sub">${m('vr_waive_first')}</span>`:''}</div>
    <div class="mf-row" style="margin:10px 0"><span class="badge pass">${t('lv_pass')} ${nf(n('pass'),0)}</span><span class="badge warn">${t('lv_warn')} ${nf(n('warn'),0)}</span><span class="badge fail">${t('lv_fail')} ${nf(n('fail'),0)}</span><span class="badge ok">${m('lv_waived')} ${nf(n('waived'),0)}</span></div>${chkHTML(cs,true)}<p class="mf-sub" style="margin:8px 0 0">${m('vr_hint')}</p></div>${reg}`}
 async function openApp(id,tab){
   let a;try{a=(await J('/api/mut/apps/'+encodeURIComponent(id))).app}catch(e){return toast(e.message)}
@@ -1701,9 +1716,11 @@ async function openApp(id,tab){
   D_.querySelectorAll('[data-reply]').forEach(b=>b.onclick=async()=>{const text=(D_.querySelector(`[data-rp="${b.dataset.reply}"]`)||{}).value||'';if(!text.trim())return;try{await J(`/api/mut/apps/${a.id}/special/${b.dataset.reply}/reply`,{text});toast(m('done'));openApp(a.id)}catch(e){toast(e.message)}});
   D_.querySelectorAll('[data-snp]').forEach(b=>b.onclick=()=>pdSpecial(a,(a.special_notices||[]).find(s=>s.id===b.dataset.snp)));
   D_.querySelectorAll('[data-snc]').forEach(b=>b.onclick=async()=>{try{await J('/api/admin/mut/apps/'+a.id+'/close_special',{sid:b.dataset.snc});openApp(a.id)}catch(e){toast(e.message)}});
-  const needR=()=>{const r=$v('ap_reason');if(!r){toast(m('need_reason'));const e=document.getElementById('ap_reason');if(e){e.scrollIntoView({block:'center'});e.focus()}}return r};
-  D_.querySelectorAll('[data-waive]').forEach(b=>b.onclick=async()=>{const reason=needR();if(!reason)return;try{await J('/api/admin/mut/apps/'+a.id+'/waive',{key:b.dataset.waive,reason});toast(m('done'));await refresh();openApp(a.id)}catch(e){toast(e.message)}});
+  const needR=async()=>{let r=$v('vr_reason')||$v('ap_reason');if(!r)r=await askReason(m('vr_waive'),'');
+    if(!r)return '';const v=document.getElementById('vr_reason');if(v&&!v.value)v.value=r;const p=document.getElementById('ap_reason');if(p&&!p.value)p.value=r;return r};
+  D_.querySelectorAll('[data-waive]').forEach(b=>b.onclick=async()=>{const reason=await needR();if(!reason)return;b.disabled=true;try{await J('/api/admin/mut/apps/'+a.id+'/waive',{key:b.dataset.waive,reason});toast(m('done'));await refresh();openApp(a.id)}catch(e){toast(e.message);b.disabled=false}});
   D_.querySelectorAll('[data-unwaive]').forEach(b=>b.onclick=async()=>{try{await J('/api/admin/mut/apps/'+a.id+'/unwaive',{key:b.dataset.unwaive});await refresh();openApp(a.id)}catch(e){toast(e.message)}});
+  D_.querySelectorAll('[data-vproceed]').forEach(b=>b.onclick=async()=>{const note=$v('vr_reason')||$v('ap_note');b.disabled=true;try{await J('/api/admin/mut/apps/'+a.id+'/verify',{note});toast(m('done'));await refresh();openApp(a.id)}catch(e){toast(e.message);b.disabled=false}});
   D_.querySelectorAll('[data-snk]').forEach(b=>b.onclick=()=>openSpecial(a,b.dataset.snk));
   bindAdmin(a)}
 
